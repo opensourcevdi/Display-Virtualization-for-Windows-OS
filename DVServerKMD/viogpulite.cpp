@@ -174,7 +174,7 @@ NTSTATUS VioGpuAdapterLite::SetCurrentModeExt(CURRENT_MODE* pCurrentMode)
 		RtlCopyMemory(&m_CurrentModeInfo, pCurrentMode, sizeof(CURRENT_MODE));
 
 		if (!m_screen[pCurrentMode->DispInfo.TargetId].m_FlushCount) {
-			DestroyFrameBufferObj(pCurrentMode->DispInfo.TargetId, FALSE);
+				DestroyFrameBufferObj(pCurrentMode->DispInfo.TargetId, FALSE);
 			CreateFrameBufferObj(&m_screen[pCurrentMode->DispInfo.TargetId].m_ModeInfo[idx], pCurrentMode);
 			DBGPRINT("screen %d: setting current mode (%d x %d)\n",
 				pCurrentMode->DispInfo.TargetId, m_screen[pCurrentMode->DispInfo.TargetId].m_ModeInfo[idx].VisScreenWidth,
@@ -508,7 +508,7 @@ NTSTATUS VioGpuAdapterLite::HWInit(WDFCMRESLIST pResList, DXGK_DISPLAY_INFORMATI
 		}
 	}
 
-	for (UINT32 i = 0; i < m_u32NumScanouts; i++) {		
+	for (UINT32 i = 0; i < m_u32NumScanouts; i++) {
 		if (!m_screen[i].m_CursorSegment.Init(POINTER_SIZE * POINTER_SIZE * 4, NULL))
 		{
 			ERR("failed to allocate Cursor memory segment\n");
@@ -686,8 +686,7 @@ NTSTATUS VioGpuAdapterLite::SetPointerShape(_In_ CONST POINTER_SHAPE* pSetPointe
 
 	TRACING();
 
-	DestroyCursor(pSetPointerShape->pointer.VidPnSourceId);
-	if (CreateCursor(pSetPointerShape, cf))
+	if (UpdateCursor(pSetPointerShape, cf))
 	{
 		PGPU_UPDATE_CURSOR crsr;
 		PGPU_VBUFFER vbuf;
@@ -716,7 +715,7 @@ NTSTATUS VioGpuAdapterLite::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSI
 {
 	PAGED_CODE();
 	TRACING();
-	
+
 	if (m_screen[pSetPointerPosition->VidPnSourceId].m_pCursorBuf != NULL)
 	{
 		PGPU_UPDATE_CURSOR crsr;
@@ -726,7 +725,7 @@ NTSTATUS VioGpuAdapterLite::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSI
 		RtlZeroMemory(crsr, sizeof(*crsr));
 
 		crsr->pos.scanout_id = pSetPointerPosition->VidPnSourceId;
-		crsr->hdr.type = VIRTIO_GPU_CMD_MOVE_CURSOR;		
+		crsr->hdr.type = VIRTIO_GPU_CMD_MOVE_CURSOR;
 		crsr->resource_id = m_screen[pSetPointerPosition->VidPnSourceId].m_pCursorBuf->GetId();
 		crsr->pos.x = pSetPointerPosition->X;
 		crsr->pos.y = pSetPointerPosition->Y;
@@ -1197,14 +1196,14 @@ void VioGpuAdapterLite::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, 
 		m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment.Init(size, NULL);
 	}
 
-	obj = new(NonPagedPoolNx) VioGpuObj();
-	if (!obj->Init(size, &m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment))
-	{
-		ERR("Failed to init obj size = %d\n", size);
-		delete obj;
-		return;
-	}
-
+		obj = new(NonPagedPoolNx) VioGpuObj();
+		if (!obj->Init(size, &m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment))
+		{
+			ERR("Failed to init obj size = %d\n", size);
+			delete obj;
+			return;
+		}
+		
 	GpuObjectAttach(resid, obj, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight,pCurrentMode->Stride);
 
 	if (m_bBlobSupported)
@@ -1250,39 +1249,14 @@ void VioGpuAdapterLite::DestroyFrameBufferObj(UINT32 screen_num, BOOLEAN bReset)
 		m_Idr.PutId(resid);
 	}
 }
-
-BOOLEAN VioGpuAdapterLite::CreateCursor(_In_ CONST POINTER_SHAPE* pSetPointerShape, _In_ CONST UINT cf)
+BOOLEAN VioGpuAdapterLite::UpdateCursor(_In_ CONST POINTER_SHAPE* pSetPointerShape,
+	_In_ CONST UINT cf)
 {
-	UINT resid, format, size;
-	VioGpuObj* obj;
-	PAGED_CODE();
-	TRACING();	
-	ASSERT(m_screen[pSetPointerShape->pointer.VidPnSourceId].m_pCursorBuf == NULL);
-	size = POINTER_SIZE * POINTER_SIZE * 4;
-	format = ColorFormat(cf);
-	resid = (UINT)m_Idr.GetId();
-	
-	if (!m_bBlobSupported) {
-		m_CtrlQueue.CreateResource(resid, format, POINTER_SIZE, POINTER_SIZE);
-	}
-
-	obj = new(NonPagedPoolNx) VioGpuObj();
-	if (!obj->Init(size, &m_screen[pSetPointerShape->pointer.VidPnSourceId].m_CursorSegment))
-	{
-		ERR("Failed to init obj size = %d\n", size);
-		delete obj;
+	if ((m_screen[pSetPointerShape->pointer.VidPnSourceId].m_pCursorBuf == NULL) &&
+		(!CreateCursor(pSetPointerShape, cf))) {
 		return FALSE;
 	}
-	
-	if (!GpuObjectAttach(resid, obj, POINTER_SIZE, POINTER_SIZE, POINTER_SIZE))
-	{
-		ERR("Failed to attach gpu object\n");
-		delete obj;
-		return FALSE;
-	}
-
-	m_screen[pSetPointerShape->pointer.VidPnSourceId].m_pCursorBuf = obj;
-
+	UINT resid = (UINT)m_Idr.GetId();
 	RECT Rect;
 	Rect.left = 0;
 	Rect.top = 0;
@@ -1292,7 +1266,7 @@ BOOLEAN VioGpuAdapterLite::CreateCursor(_In_ CONST POINTER_SHAPE* pSetPointerSha
 	BLT_INFO DstBltInfo;
 	DstBltInfo.pBits = m_screen[pSetPointerShape->pointer.VidPnSourceId].m_pCursorBuf->GetVirtualAddress();
 	DstBltInfo.Pitch = POINTER_SIZE * 4;
-	DstBltInfo.PixelFmt = D3DDDIFMT_A8B8G8R8;
+	DstBltInfo.PixelFmt = D3DDDIFMT_A8R8G8B8;
 	DstBltInfo.BitsPerPel = BPPFromPixelFormat(DstBltInfo.PixelFmt);
 	DstBltInfo.Offset.x = 0;
 	DstBltInfo.Offset.y = 0;
@@ -1318,6 +1292,41 @@ BOOLEAN VioGpuAdapterLite::CreateCursor(_In_ CONST POINTER_SHAPE* pSetPointerSha
 		&Rect);
 
 	m_CtrlQueue.TransferToHost2D(resid, 0, pSetPointerShape->pointer.Width, pSetPointerShape->pointer.Height, 0, 0, NULL);
+
+	return TRUE;
+}
+
+BOOLEAN VioGpuAdapterLite::CreateCursor(_In_ CONST POINTER_SHAPE* pSetPointerShape, _In_ CONST UINT cf)
+{
+	UINT resid, format, size;
+	VioGpuObj* obj;
+	PAGED_CODE();
+	TRACING();
+	ASSERT(m_screen[pSetPointerShape->pointer.VidPnSourceId].m_pCursorBuf == NULL);
+	size = POINTER_SIZE * POINTER_SIZE * 4;
+	format = ColorFormat(cf);
+	resid = (UINT)m_Idr.GetId();
+
+	if (!m_bBlobSupported) {
+		m_CtrlQueue.CreateResource(resid, format, POINTER_SIZE, POINTER_SIZE);
+	}
+
+	obj = new(NonPagedPoolNx) VioGpuObj();
+	if (!obj->Init(size, &m_screen[pSetPointerShape->pointer.VidPnSourceId].m_CursorSegment))
+	{
+		ERR("Failed to init obj size = %d\n", size);
+		delete obj;
+		return FALSE;
+	}
+
+	if (!GpuObjectAttach(resid, obj, POINTER_SIZE, POINTER_SIZE, POINTER_SIZE))
+	{
+		ERR("Failed to attach gpu object\n");
+		delete obj;
+		return FALSE;
+	}
+
+	m_screen[pSetPointerShape->pointer.VidPnSourceId].m_pCursorBuf = obj;
 
 	return TRUE;
 }
