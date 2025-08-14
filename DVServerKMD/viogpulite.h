@@ -99,11 +99,12 @@ public:
 	KEVENT m_EdidEvent;
 	KEVENT m_FlushEvent;
 	VioGpuMemSegment m_FrameSegment;
-	VioGpuObj* m_pFrameBuf;
-	VioGpuObj * m_pCursorBuf;
+	VioGpuObj* m_pFrameBuf[2];
+	VioGpuObj* m_pCursorBuf;
 	VioGpuMemSegment m_CursorSegment;
 	BOOL m_FlushCount;
 	BOOL enabled;
+
 
 public:
 	ScreenInfo();
@@ -112,10 +113,17 @@ public:
 	ULONG GetModeCount(void) { return m_ModeCount; }
 	USHORT GetModeNumber(USHORT idx) { return m_ModeNumbers[idx]; }
 	USHORT GetCurrentModeIndex(void) { return m_CurrentMode; }
+	VioGpuObj* GetCurrentFrameBufferObj(void) { return m_pFrameBuf[m_CurrentFrameBufIndex]; }
+	VioGpuObj* GetCurrentFrameBackBufferObj(void) { return m_pFrameBuf[!m_CurrentFrameBufIndex]; }
+	void SetCurrentFrameBackBufferObj(VioGpuObj* buf) { m_pFrameBuf[!m_CurrentFrameBufIndex] = buf; };
+	void SwapFramebuffer() { m_CurrentFrameBufIndex = 1 - m_CurrentFrameBufIndex; };
+	void SetCurrentFramebufferObj(VioGpuObj* fbuf) { m_pFrameBuf[m_CurrentFrameBufIndex] = fbuf; }
 	void SetCurrentModeIndex(USHORT idx) { m_CurrentMode = idx; }
 	void SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres);
 	void SetVideoModeInfo(UINT Idx, PGPU_DISP_MODE_EXT pModeInfo);
 	void Reset();
+private:
+	UINT m_CurrentFrameBufIndex;
 };
 
 class IVioGpuAdapterLite {
@@ -212,7 +220,7 @@ private:
 	BOOLEAN GetEdids(UINT32 screen_num);
 	void AddEdidModes(UINT32 screen_num);
 	void CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURRENT_MODE* pCurrentMode);
-	void DestroyFrameBufferObj(UINT32 screen_num, BOOLEAN bReset);
+	void DestroyFrameBufferObj(VioGpuObj* fBuffer, BOOLEAN bReset);
 	BOOLEAN CreateCursor(_In_ CONST POINTER_SHAPE* pSetPointerShape, _In_ CONST UINT cf);
 	BOOLEAN UpdateCursor(_In_ CONST POINTER_SHAPE* pSetPointerShape, _In_ CONST UINT cf);
 	void DestroyCursor(UINT32 screen_num);
