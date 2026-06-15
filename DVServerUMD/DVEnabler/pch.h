@@ -20,10 +20,19 @@
 #define DISP_INFO L"Global\\DISP_INFO"
 #define DELAY_TIME 50
 int dvenabler_init();
+static void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO &Mode, DWORD Width, DWORD Height, DWORD VSync);
+struct disp_target_res
+{
+	UINT32 cx;
+	UINT32 cy;
+	DWORD refresh;
+	bool set;
+};
 struct disp_info
 {
 	int disp_count;
 	HANDLE mutex;
+	disp_target_res disp_target_res[4];
 };
 int GetDisplayCount(disp_info *pdinfo);
 int IsSystemLocked();

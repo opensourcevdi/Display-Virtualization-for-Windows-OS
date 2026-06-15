@@ -28,6 +28,7 @@ int dvenabler_init()
 	int status;
 	unsigned int path_count = NULL, mode_count = NULL;
 	bool found_id_path = FALSE, found_non_id_path = FALSE;
+	bool set_disp = FALSE;
 	disp_info dinfo = {0};
 	/* Initializing the baseType.baseOutputTechnology to default OS value(failcase) */
 	baseType.baseOutputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER;
@@ -101,6 +102,35 @@ int dvenabler_init()
 			ERR("QueryDisplayConfig failed with %s. Exiting!!!\n", err);
 			continue;
 		}
+		for (auto &mode: mode_list){
+
+			// TOOD CHECK CORRECT ADAPTER
+			int monIndex = 0;// mode.id;
+			if (monIndex > 4) {
+				DBGPRINT("Error: monIndex==%d", monIndex);
+			} else {
+				UINT32 newWidth = dinfo.disp_target_res[monIndex].cx;
+				UINT32 newHeight = dinfo.disp_target_res[monIndex].cy;
+				DWORD newRefresh = dinfo.disp_target_res[monIndex].refresh;
+				DBGPRINT("Displ: %d, infoType: %d newWidth: %u, newHeight: %u, newRefresh: %d", monIndex,
+						 mode.infoType,newWidth, newHeight,
+						 newRefresh);
+				if (mode.infoType ==
+					DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+					mode.sourceMode.width = newWidth;
+					mode.sourceMode.height = newHeight;
+				}
+				if (mode.infoType ==
+					DISPLAYCONFIG_MODE_INFO_TYPE_TARGET) {
+
+					FillSignalInfo(
+						mode.targetMode.targetVideoSignalInfo,
+						newWidth, newHeight, newRefresh);
+				}
+				
+				set_disp = FALSE;
+			}
+		}
 
 		for (auto &activepath_loopindex : path_list) {
 			baseType.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_BASE_TYPE;
@@ -139,6 +169,30 @@ int dvenabler_init()
 					found_id_path = true;
 				}
 			}
+
+			// force preferred resolution
+			// if (baseType.baseOutputTechnology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED) {
+			// 	DISPLAYCONFIG_TARGET_PREFERRED_MODE preferredMode = {};
+			// 	preferredMode.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE;
+			// 	preferredMode.header.size = sizeof(DISPLAYCONFIG_TARGET_PREFERRED_MODE);
+			// 	preferredMode.header.adapterId = activepath_loopindex.sourceInfo.adapterId;
+			// 	preferredMode.header.id = activepath_loopindex.targetInfo.id;
+			// 	if (DisplayConfigGetDeviceInfo(&preferredMode.header) == ERROR_SUCCESS) {
+			// 		int native_width = preferredMode.width;
+			// 		int native_height = preferredMode.height;
+
+			// 		DISPLAYCONFIG_MODE_INFO &mode = mode_list[activepath_loopindex.sourceInfo.modeInfoIdx];
+			// 		mode.targetMode.targetVideoSignalInfo.totalSize.cx = native_width;
+			// 		mode.targetMode.targetVideoSignalInfo.totalSize.cy = native_height;
+			// 		// Ensure the source mode matches the target mode
+			// 		mode.sourceMode.width = native_width;
+			// 		mode.sourceMode.height = native_height;
+			// 		// Crucial: Set the scaling to fit
+			// 		activepath_loopindex.targetInfo.scaling = DISPLAYCONFIG_SCALING_ASPECTRATIOCENTEREDMAX;
+
+			// 	}
+
+			// }
 		}
 
 		if ((found_non_id_path && (path_count != static_cast<unsigned int>(dinfo.disp_count + 1))) ||
@@ -152,15 +206,16 @@ int dvenabler_init()
 			continue;
 		}
 
-		if (found_non_id_path && found_id_path) {
+		if (set_disp || (found_non_id_path && found_id_path)) {
 			/* Step 5: SetDisplayConfig modifies the display topology by exclusively enabling/disabling the specified
 					   paths in the current session. */
+			set_disp = FALSE;
 			if (SetDisplayConfig(path_count, path_list.data(), mode_count, mode_list.data(),
-								 SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE) != ERROR_SUCCESS) {
+								 SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG ) != ERROR_SUCCESS) {
 				FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, GetLastError(),
 							   MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), err, 255, NULL);
 				ERR("SetDisplayConfig failed with %s\n", err);
-				continue;
+				//continue;
 			}
 		} else {
 			DBGPRINT("Skipping SetDisplayConfig as did not find ID and non-ID path. found_non_id_path = %d, "
@@ -192,6 +247,24 @@ int dvenabler_init()
 
 	return 0;
 }
+
+
+static void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, DWORD Width, DWORD Height, DWORD VSync)
+{
+    Mode.totalSize.cx = Mode.activeSize.cx = Width;
+    Mode.totalSize.cy = Mode.activeSize.cy = Height;
+
+    Mode.AdditionalSignalInfo.vSyncFreqDivider = 1;
+    Mode.AdditionalSignalInfo.videoStandard = 255; // Custom standard
+
+    Mode.vSyncFreq.Numerator = VSync;
+    Mode.vSyncFreq.Denominator = 1;
+    Mode.hSyncFreq.Numerator = VSync * Height;
+    Mode.hSyncFreq.Denominator = 1;
+
+    Mode.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
+}
+
 
 int GetDisplayCount(disp_info *pdinfo)
 {

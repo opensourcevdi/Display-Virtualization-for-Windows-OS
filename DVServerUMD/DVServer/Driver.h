@@ -72,6 +72,7 @@ struct IndirectSampleMonitor
 		DWORD VSync;
 	} pModeList[szModeList];
 	DWORD ulPreferredModeIdx;
+	UINT currentModeList = 0;
 };
 
 /// <summary>
@@ -187,10 +188,10 @@ public:
 	void UnassignSwapChain();
 
 	void SetupDVServerCursor();
+	UINT m_MonitorIndex;
 
 private:
 	IDDCX_MONITOR m_Monitor;
-	UINT m_MonitorIndex;
 	std::unique_ptr<SwapChainProcessor> m_ProcessingThread;
 	HANDLE m_cursor_event;
 };
@@ -200,11 +201,20 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject);
 int get_hpd_data(HANDLE devHandle, struct hp_info *data);
 bool IsWindows11OrLater();
 DWORD GetGpuDeviceId();
+struct disp_target_res
+{
+	int cx;
+	int cy;
+	DWORD refresh;
+	bool set;
+};
 struct disp_info
 {
 	int disp_count;
 	HANDLE mutex;
+	disp_target_res disp_target_res[MAX_SCAN_OUT];
 };
+
 
 struct monitor_info
 {

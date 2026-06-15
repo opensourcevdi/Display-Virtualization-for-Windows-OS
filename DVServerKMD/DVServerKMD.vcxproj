@@ -53,7 +53,7 @@
     <Configuration>Debug</Configuration>
     <Platform Condition="'$(Platform)' == ''">Win32</Platform>
     <RootNamespace>DVServerKMD</RootNamespace>
-    <WindowsTargetPlatformVersion>10.0.22621.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
@@ -84,11 +84,11 @@
   <PropertyGroup />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-	<Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
+    <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-	<Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
+    <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -154,9 +154,6 @@ certmgr -del -c -n "DVServerKMD" -s PrivateCertStore</Command>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
   <Target Name="GenerateVersionHeader" BeforeTargets="ClCompile">
-   <Exec 
-    Command="&quot;$(SolutionDir)generate_version_header.bat&quot; &quot;$(ProjectDir)DVServerKMD_Version.txt&quot; &quot;$(ProjectDir)&quot;" 
-    WorkingDirectory="$(ProjectDir)" 
-   />
- </Target>
+    <Exec Command="&quot;$(SolutionDir)generate_version_header.bat&quot; &quot;$(ProjectDir)DVServerKMD_Version.txt&quot; &quot;$(ProjectDir)&quot;" WorkingDirectory="$(ProjectDir)" />
+  </Target>
 </Project>
