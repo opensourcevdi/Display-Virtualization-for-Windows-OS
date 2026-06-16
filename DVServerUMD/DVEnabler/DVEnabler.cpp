@@ -133,22 +133,6 @@ int dvenabler_init()
 						mode_list[activepath_loopindex.sourceInfo.modeInfoIdx].sourceMode.position.x = 0;
 						mode_list[activepath_loopindex.sourceInfo.modeInfoIdx].sourceMode.position.y = 0;
 						DBGPRINT("x, y  = %dX%x\n",
-								 mode_list[activepath_loopindex.sourceInfo.modeInfoIdx].sourceMode.position.x,
-								 mode_list[activepath_loopindex.sourceInfo.modeInfoIdx].sourceMode.position.y);
-					}
-					found_id_path = true;
-				}
-			}
-		}
-
-		if ((found_non_id_path && (path_count != static_cast<unsigned int>(dinfo.disp_count + 1))) ||
-			(!found_non_id_path && (path_count != static_cast<unsigned int>(dinfo.disp_count)))) {
-			if (found_non_id_path) {
-				DBGPRINT("MSFT display is present. Path count not updated, so loop again");
-			} else {
-				DBGPRINT("MSFT display is not present. Path count not updated, so loop again");
-			}
-			DBGPRINT("disp_count = %d, path count = %d", dinfo.disp_count, path_count);
 			continue;
 		}
 
@@ -156,7 +140,7 @@ int dvenabler_init()
 			/* Step 5: SetDisplayConfig modifies the display topology by exclusively enabling/disabling the specified
 					   paths in the current session. */
 			if (SetDisplayConfig(path_count, path_list.data(), mode_count, mode_list.data(),
-								 SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE) != ERROR_SUCCESS) {
+								 SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG) != ERROR_SUCCESS) {
 				FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, GetLastError(),
 							   MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), err, 255, NULL);
 				ERR("SetDisplayConfig failed with %s\n", err);

@@ -23,7 +23,7 @@
     <Keyword>Win32Proj</Keyword>
     <ProjectGuid>{1cbf91f2-3537-44a7-a052-d9f4f9c1c2b6}</ProjectGuid>
     <RootNamespace>DVEnablerDLL</RootNamespace>
-    <WindowsTargetPlatformVersion>10.0.22621.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
     <ProjectName>DVEnabler</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -198,9 +198,6 @@
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
   <Target Name="GenerateVersionHeader" BeforeTargets="ClCompile">
-    <Exec 
-    Command="&quot;$(SolutionDir)generate_version_header.bat&quot; &quot;$(ProjectDir)DVEnabler_Version.txt&quot; &quot;$(ProjectDir)&quot;" 
-    WorkingDirectory="$(ProjectDir)" 
-    />
+    <Exec Command="&quot;$(SolutionDir)generate_version_header.bat&quot; &quot;$(ProjectDir)DVEnabler_Version.txt&quot; &quot;$(ProjectDir)&quot;" WorkingDirectory="$(ProjectDir)" />
   </Target>
 </Project>

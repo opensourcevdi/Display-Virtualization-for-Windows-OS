@@ -1254,6 +1254,14 @@ void IndirectDeviceContext::InitAdapter(WDF_POWER_DEVICE_STATE PreviousState)
 	}
 }
 
+static const GUID s_MonitorContainerIds[MAX_SCAN_OUT] =
+{
+    { 0x3E0F9D5E, 0x8A90, 0x4B76, { 0x96, 0xC7, 0x4E, 0x2D, 0x2F, 0x6B, 0x9E, 0x56 } },
+    { 0xD1E5F7A2, 0x2A39, 0x4B63, { 0xB6, 0xAA, 0x54, 0xC4, 0xC7, 0xF1, 0xD9, 0xE2 } },
+    { 0x8C1A2B3C, 0x11AA, 0x4D55, { 0xA1, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 } },
+    { 0xF0E1D2C3, 0x9B88, 0x4C77, { 0x90, 0xAB, 0xCD, 0xEF, 0x10, 0x32, 0x54, 0x76 } },
+};
+
 void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
 {
 	// ==============================
@@ -1294,7 +1302,7 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
 	// ==============================
 
 	// Create a container ID
-	CoCreateGuid(&MonitorInfo.MonitorContainerId);
+	MonitorInfo.MonitorContainerId = s_MonitorContainerIds[ConnectorIndex];
 
 	IDARG_IN_MONITORCREATE MonitorCreate = {};
 	MonitorCreate.ObjectAttributes = &Attr;
