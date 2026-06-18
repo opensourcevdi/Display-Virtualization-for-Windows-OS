@@ -15,6 +15,8 @@
 #include <stdio.h>
 #include <string.h>
 
+bool operator==(const LUID &a, const LUID &b) { return a.LowPart == b.LowPart && a.HighPart == b.HighPart; }
+
 int dvenabler_init()
 {
 	WPP_INIT_TRACING(NULL);
@@ -71,7 +73,7 @@ int dvenabler_init()
 			DBGPRINT("System is in locked state, so wait untill system gets unlocked");
 			continue;
 		}
-
+		Sleep(2000);
 		// Reset the flags before doing QDC
 		path_count = NULL, mode_count = NULL;
 		found_id_path = FALSE, found_non_id_path = FALSE;
@@ -87,7 +89,7 @@ int dvenabler_init()
 		/* Initializing STL vectors for all the paths and its respective modes */
 		std::vector<DISPLAYCONFIG_PATH_INFO> path_list(path_count);
 		std::vector<DISPLAYCONFIG_MODE_INFO> mode_list(mode_count);
-
+		std::vector<LUID> idds(path_count);
 		// Get the Display info shared from DVServerUMD
 		if (GetDisplayCount(&dinfo) == DVENABLER_FAILURE) {
 			ERR("shared mem read failed");
@@ -102,36 +104,11 @@ int dvenabler_init()
 			ERR("QueryDisplayConfig failed with %s. Exiting!!!\n", err);
 			continue;
 		}
-		for (auto &mode: mode_list){
+		DBGPRINT("QueryDisplayConfig  mode_list.size: %Iu", mode_list.size());
 
-			// TOOD CHECK CORRECT ADAPTER
-			int monIndex = 0;// mode.id;
-			if (monIndex > 4) {
-				DBGPRINT("Error: monIndex==%d", monIndex);
-			} else {
-				UINT32 newWidth = dinfo.disp_target_res[monIndex].cx;
-				UINT32 newHeight = dinfo.disp_target_res[monIndex].cy;
-				DWORD newRefresh = dinfo.disp_target_res[monIndex].refresh;
-				DBGPRINT("Displ: %d, infoType: %d newWidth: %u, newHeight: %u, newRefresh: %d", monIndex,
-						 mode.infoType,newWidth, newHeight,
-						 newRefresh);
-				if (mode.infoType ==
-					DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
-					mode.sourceMode.width = newWidth;
-					mode.sourceMode.height = newHeight;
-				}
-				if (mode.infoType ==
-					DISPLAYCONFIG_MODE_INFO_TYPE_TARGET) {
 
-					FillSignalInfo(
-						mode.targetMode.targetVideoSignalInfo,
-						newWidth, newHeight, newRefresh);
-				}
-				
-				set_disp = FALSE;
-			}
-		}
 
+		
 		for (auto &activepath_loopindex : path_list) {
 			baseType.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_BASE_TYPE;
 			baseType.header.size = sizeof(baseType);
@@ -143,6 +120,10 @@ int dvenabler_init()
 			if (DisplayConfigGetDeviceInfo(&baseType.header) != ERROR_SUCCESS) {
 				ERR("DisplayConfigGetDeviceInfo failed... Continuing with other active paths!!!\n");
 				continue;
+			}
+			if (baseType.baseOutputTechnology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED) {
+				
+				idds.push_back(baseType.header.adapterId);
 			}
 
 			DBGPRINT("baseType.baseOutputTechnology = %d\n", baseType.baseOutputTechnology);
@@ -194,6 +175,40 @@ int dvenabler_init()
 
 			// }
 		}
+		for (auto &mode : mode_list) {
+
+			// TOOD CHECK CORRECT ADAPTER
+
+			if (!(std::find(idds.begin(), idds.end(), mode.adapterId) != idds.end())) {
+				break;
+			}
+
+			int monIndex = 0; // mode.id;
+			if (monIndex > 4) {
+				DBGPRINT("Error: monIndex==%d", monIndex);
+			} else {
+				
+				UINT32 newWidth = dinfo.disp_target_res[monIndex].cx;
+				UINT32 newHeight = dinfo.disp_target_res[monIndex].cy;
+				DWORD newRefresh = dinfo.disp_target_res[monIndex].refresh;
+				DBGPRINT("Displ: %d, infoType: %d newWidth: %u, newHeight: %u, newRefresh: %d", monIndex, mode.infoType,
+						 newWidth, newHeight, newRefresh);
+				if (mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+
+					if (mode.sourceMode.width != newWidth || mode.sourceMode.height != newHeight) {
+						mode.sourceMode.width = newWidth;
+						mode.sourceMode.height = newHeight;
+						set_disp = TRUE;
+					}
+				}
+				if (mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET) {
+
+					FillSignalInfo(mode.targetMode.targetVideoSignalInfo, newWidth, newHeight, newRefresh);
+				}
+
+				// set_disp = TRUE;
+			}
+		}
 
 		if ((found_non_id_path && (path_count != static_cast<unsigned int>(dinfo.disp_count + 1))) ||
 			(!found_non_id_path && (path_count != static_cast<unsigned int>(dinfo.disp_count)))) {
@@ -211,7 +226,7 @@ int dvenabler_init()
 					   paths in the current session. */
 			set_disp = FALSE;
 			if (SetDisplayConfig(path_count, path_list.data(), mode_count, mode_list.data(),
-								 SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG ) != ERROR_SUCCESS) {
+								 SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG) != ERROR_SUCCESS) {
 				FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, GetLastError(),
 							   MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), err, 255, NULL);
 				ERR("SetDisplayConfig failed with %s\n", err);
@@ -249,7 +264,8 @@ int dvenabler_init()
 }
 
 
-static void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, DWORD Width, DWORD Height, DWORD VSync)
+
+static inline void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, DWORD Width, DWORD Height, DWORD VSync)
 {
     Mode.totalSize.cx = Mode.activeSize.cx = Width;
     Mode.totalSize.cy = Mode.activeSize.cy = Height;
@@ -263,6 +279,7 @@ static void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, DWORD Width, D
     Mode.hSyncFreq.Denominator = 1;
 
     Mode.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
+	Mode.pixelRate =  (UINT64)VSync * (UINT64)Width * (UINT64)Height;
 }
 
 
