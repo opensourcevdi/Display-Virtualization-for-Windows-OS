@@ -39,3 +39,16 @@ public:
 // USEPREFIX(DBGPRINT, "%!STDPREFIX! [%!FUNC!:%!LINE!] [DBG] \t");
 // USEPREFIX(INFO, "%!STDPREFIX! [%!FUNC!:%!LINE!] [INFO] \t");
 // end_wpp
+
+#include <cstdio>
+inline static void log(const char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	FILE *file = 0;
+	fopen_s(&file, "c:\\windows\\temp\\idd.txt", "a");
+	if (!file) return;
+	vfprintf(file, fmt, args);
+	fclose(file);
+	va_end(args);
+}
