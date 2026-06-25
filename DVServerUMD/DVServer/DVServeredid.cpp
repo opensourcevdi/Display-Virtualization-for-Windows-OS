@@ -38,6 +38,8 @@ unsigned int blacklisted_resolution_list[][2] = {{1400, 1050}}; // blacklisted r
  ******************************************************************************/
 int get_edid_data(HANDLE devHandle, void *m, DWORD id, BOOL d_edid)
 {
+	if (id == 1)
+		id = 0;
 	TRACING();
 	char err[256];
 	memset(err, 0, 256);

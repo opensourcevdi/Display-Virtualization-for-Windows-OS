@@ -1760,6 +1760,7 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 				ERR("HotPlug resource allocation failed... Going back to the loop again");
 				continue;
 			}
+			hdata.screen_present[1] = {1};
 
 			// call display arrival and departure based on previous and current display state.
 			for (count = 0; count < MAX_SCAN_OUT; count++) {
@@ -1796,18 +1797,42 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 					}
 
 					if (memcmp(minfo[count].pEdidBlock, g_monitors[count].pEdidBlock, minfo->szEdidBlock) != 0) {
-						DBGPRINT("EDID changed for display = %d\n", count);
+						log("EDID changed for display = %d\n", count);
 
 						// Reset the edid block and copy the new edid block
 						memset(minfo[count].pEdidBlock, 0, minfo[count].szEdidBlock);
 						memcpy_s(minfo[count].pEdidBlock, minfo->szEdidBlock, g_monitors[count].pEdidBlock,
 								 minfo->szEdidBlock);
 
+						unsigned char *edid = minfo[count].pEdidBlock;
+						int w = ((edid[0x36 + 4] >> 4) << 8) | edid[0x36 + 2], h = ((edid[0x36 + 7] >> 4) << 8) | edid[0x36 + 5];
+						log("size of new EDID for display = %d is %dx%d\n", count, w, h);
+
+						struct { int Width, Height; } Modes[] = {
+							{w, h},
+							{1920,1080},
+						};
+						UINT ModeCount = sizeof(Modes) / sizeof(Modes[0]);
+
+						// See https://github.com/rustdesk-org/RustDeskIddDriver/blob/17ddb6eb9c6f1742453ef00279b4bb07496e0bbe/RustDeskIddDriver/Driver.cpp#L970
+						IDDCX_TARGET_MODE* PTargetMode = (IDDCX_TARGET_MODE*)malloc(sizeof(IDDCX_TARGET_MODE) * ModeCount);
+						for (UINT i = 0; i < ModeCount; ++i)
+						{
+							PTargetMode[i] = CreateIddCxTargetMode(
+								Modes[i].Width,
+								Modes[i].Height,
+								60);
+						}
+						IDARG_IN_UPDATEMODES UpdateModes{ IDDCX_UPDATE_REASON_OTHER, ModeCount, PTargetMode };
+						NTSTATUS Status = IddCxMonitorUpdateModes(g_monitorobject_list[count], &UpdateModes);
+						free(PTargetMode);
+						log("UpdateModes returned 0x%X for display = %d\n", Status, count);
+
 						// Remove the display and connect it again with fresh EDID
-						IddCxMonitorDeparture(g_monitorobject_list[count]);
-						g_monitorobject_list[count] = NULL;
-						pDeviceContextWrapper->pContext->FinishInit(count);
-						do_set_event = TRUE;
+						// IddCxMonitorDeparture(g_monitorobject_list[count]);
+						// g_monitorobject_list[count] = NULL;
+						// pDeviceContextWrapper->pContext->FinishInit(count);
+						// do_set_event = TRUE;
 					} else {
 						DBGPRINT("No changes in DISPLAY = %d\n", count);
 					}
