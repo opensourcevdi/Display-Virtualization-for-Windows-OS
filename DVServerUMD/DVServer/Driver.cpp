@@ -1803,11 +1803,32 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 						memcpy_s(minfo[count].pEdidBlock, minfo->szEdidBlock, g_monitors[count].pEdidBlock,
 								 minfo->szEdidBlock);
 
+						unsigned char *edid = minfo[count].pEdidBlock;
+						int w = ((edid[0x36 + 4] >> 4) << 8) | edid[0x36 + 2], h = ((edid[0x36 + 7] >> 4) << 8) | edid[0x36 + 5];
+
+						struct { int Width, Height; } Modes[] = {
+							{w, h},
+						};
+						UINT ModeCount = sizeof(Modes) / sizeof(Modes[0]);
+
+						// See https://github.com/rustdesk-org/RustDeskIddDriver/blob/17ddb6eb9c6f1742453ef00279b4bb07496e0bbe/RustDeskIddDriver/Driver.cpp#L970
+						IDDCX_TARGET_MODE* PTargetMode = (IDDCX_TARGET_MODE*)malloc(sizeof(IDDCX_TARGET_MODE) * ModeCount);
+						for (UINT i = 0; i < ModeCount; ++i)
+						{
+							PTargetMode[i] = CreateIddCxTargetMode(
+								Modes[i].Width,
+								Modes[i].Height,
+								60);
+						}
+						IDARG_IN_UPDATEMODES UpdateModes{ IDDCX_UPDATE_REASON_OTHER, ModeCount, PTargetMode };
+						NTSTATUS Status = IddCxMonitorUpdateModes(g_monitorobject_list[count], &UpdateModes);
+						free(PTargetMode);
+
 						// Remove the display and connect it again with fresh EDID
-						IddCxMonitorDeparture(g_monitorobject_list[count]);
-						g_monitorobject_list[count] = NULL;
-						pDeviceContextWrapper->pContext->FinishInit(count);
-						do_set_event = TRUE;
+						// IddCxMonitorDeparture(g_monitorobject_list[count]);
+						// g_monitorobject_list[count] = NULL;
+						// pDeviceContextWrapper->pContext->FinishInit(count);
+						// do_set_event = TRUE;
 					} else {
 						DBGPRINT("No changes in DISPLAY = %d\n", count);
 					}
