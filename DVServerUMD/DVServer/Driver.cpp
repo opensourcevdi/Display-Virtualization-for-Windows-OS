@@ -1760,7 +1760,7 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 				ERR("HotPlug resource allocation failed... Going back to the loop again");
 				continue;
 			}
-			hdata.screen_present[1] = {1};
+			// hdata.screen_present[1] = {1};
 
 			// call display arrival and departure based on previous and current display state.
 			for (count = 0; count < MAX_SCAN_OUT; count++) {
@@ -1810,7 +1810,7 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 
 						struct { int Width, Height; } Modes[] = {
 							{w, h},
-							{1920,1080},
+						//	{1920,1080},
 						};
 						UINT ModeCount = sizeof(Modes) / sizeof(Modes[0]);
 
