@@ -59,48 +59,6 @@ static const struct IndirectSampleMonitor::SampleMonitorMode s_SampleDefaultMode
 	{1024, 768, 75},
 };
 
-static const struct IndirectSampleMonitor s_SampleMonitors[] =
-{
-    // Modified EDID from Dell S2719DGF
-    {
-        {
-            0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00,0x10,0xAC,0xE6,0xD0,0x55,0x5A,0x4A,0x30,0x24,0x1D,0x01,
-            0x04,0xA5,0x3C,0x22,0x78,0xFB,0x6C,0xE5,0xA5,0x55,0x50,0xA0,0x23,0x0B,0x50,0x54,0x00,0x02,0x00,
-            0xD1,0xC0,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x58,0xE3,0x00,
-            0xA0,0xA0,0xA0,0x29,0x50,0x30,0x20,0x35,0x00,0x55,0x50,0x21,0x00,0x00,0x1A,0x00,0x00,0x00,0xFF,
-            0x00,0x37,0x4A,0x51,0x58,0x42,0x59,0x32,0x0A,0x20,0x20,0x20,0x20,0x20,0x00,0x00,0x00,0xFC,0x00,
-            0x53,0x32,0x37,0x31,0x39,0x44,0x47,0x46,0x0A,0x20,0x20,0x20,0x20,0x00,0x00,0x00,0xFD,0x00,0x28,
-            0x9B,0xFA,0xFA,0x40,0x01,0x0A,0x20,0x20,0x20,0x20,0x20,0x20,0x00,0x2C
-        },
-        {
-            { 2560, 1440, 144 },
-            { 1920, 1080,  60 },
-            { 1024,  768,  60 },
-        },
-        0
-    },
-    // Modified EDID from Lenovo Y27fA
-    {
-        {
-            0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00,0x30,0xAE,0xBF,0x65,0x01,0x01,0x01,0x01,0x20,0x1A,0x01,
-            0x04,0xA5,0x3C,0x22,0x78,0x3B,0xEE,0xD1,0xA5,0x55,0x48,0x9B,0x26,0x12,0x50,0x54,0x00,0x08,0x00,
-            0xA9,0xC0,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x68,0xD8,0x00,
-            0x18,0xF1,0x70,0x2D,0x80,0x58,0x2C,0x45,0x00,0x53,0x50,0x21,0x00,0x00,0x1E,0x00,0x00,0x00,0x10,
-            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFD,0x00,
-            0x30,0x92,0xB4,0xB4,0x22,0x01,0x0A,0x20,0x20,0x20,0x20,0x20,0x20,0x00,0x00,0x00,0xFC,0x00,0x4C,
-            0x45,0x4E,0x20,0x59,0x32,0x37,0x66,0x41,0x0A,0x20,0x20,0x20,0x00,0x11
-        },
-        {
-            { 3840, 2160,  60 },
-            { 1600,  900,  60 },
-            { 1024,  768,  60 },
-        },
-        0
-    }
-    // Another EDID
-    // https://github.com/roshkins/IddSampleDriver/blob/df7238c1f242e1093cdcab0ea749f34094570283/IddSampleDriver/Driver.cpp#L419
-};
-
 IDDCX_MONITOR g_DvserverCxMonitorObject[MAX_SCAN_OUT] = {0};
 IDARG_IN_QUERY_HWCURSOR g_inputargs[MAX_SCAN_OUT] = {0};
 Microsoft::WRL::Wrappers::Event g_dvserver_cursor_os_event[MAX_SCAN_OUT];
@@ -1246,7 +1204,7 @@ void IndirectDeviceContext::InitAdapter(WDF_POWER_DEVICE_STATE PreviousState)
 		AdapterCaps.Size = sizeof(AdapterCaps);
 
 		// This flag enables IDD Display to change the resolution
-		//AdapterCaps.Flags = IDDCX_ADAPTER_FLAGS_USE_SMALLEST_MODE;
+		AdapterCaps.Flags = IDDCX_ADAPTER_FLAGS_USE_SMALLEST_MODE;
 
 		// Declare basic feature support for the adapter (required)
 		AdapterCaps.MaxMonitorsSupported = dvserver_monitor_count;
@@ -1314,19 +1272,19 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
 	// event occurs
 	IDDCX_MONITOR_INFO MonitorInfo = {};
 	MonitorInfo.Size = sizeof(MonitorInfo);
-	MonitorInfo.MonitorType =  DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
+	MonitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED; // DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
 	MonitorInfo.ConnectorIndex = ConnectorIndex;
 
 	MonitorInfo.MonitorDescription.Size = sizeof(MonitorInfo.MonitorDescription);
 	MonitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-	//if (ConnectorIndex >= dvserver_monitor_count) {
+	if (ConnectorIndex >= dvserver_monitor_count) {
 		MonitorInfo.MonitorDescription.DataSize = 0;
 		MonitorInfo.MonitorDescription.pData = nullptr;
-	//} else {
-//		MonitorInfo.MonitorDescription.DataSize = IndirectSampleMonitor::szEdidBlock;
-//		MonitorInfo.MonitorDescription.pData = const_cast<BYTE*>(s_SampleMonitors[0].pEdidBlock);
-	//}
-	
+	} else {
+		MonitorInfo.MonitorDescription.DataSize = IndirectSampleMonitor::szEdidBlock;
+		MonitorInfo.MonitorDescription.pData = const_cast<BYTE *>(g_monitors[ConnectorIndex].pEdidBlock);
+	}
+
 	// ==============================
 	// TODO: The monitor's container ID should be distinct from "this" device's container ID if the monitor is not
 	// permanently attached to the display adapter device object. The container ID is typically made unique for each
@@ -1528,24 +1486,23 @@ _Use_decl_annotations_ NTSTATUS DVServerUMDParseMonitorDescription(const IDARG_I
 			return STATUS_INVALID_PARAMETER;
 
 		for (DWORD SampleMonitorIdx = 0; SampleMonitorIdx < dvserver_monitor_count; SampleMonitorIdx++) {
-			if (memcmp(pInArgs->MonitorDescription.pData, s_SampleMonitors[SampleMonitorIdx].pEdidBlock,
+			if (memcmp(pInArgs->MonitorDescription.pData, g_monitors[SampleMonitorIdx].pEdidBlock,
 					   IndirectSampleMonitor::szEdidBlock) == 0) {
 				// Copy the known modes to the output buffer
-				DBGPRINT("DVServerUMDParseMonitorDescription found mon %d", SampleMonitorIdx);
 				for (DWORD ModeIndex = 0; ModeIndex < IndirectSampleMonitor::szModeList; ModeIndex++) {
 					pInArgs->pMonitorModes[ModeIndex] =
-						CreateIddCxMonitorMode(s_SampleMonitors[SampleMonitorIdx].pModeList[ModeIndex].Width,
-											   s_SampleMonitors[SampleMonitorIdx].pModeList[ModeIndex].Height,
-											   s_SampleMonitors[SampleMonitorIdx].pModeList[ModeIndex].VSync,
+						CreateIddCxMonitorMode(g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Width,
+											   g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Height,
+											   g_monitors[SampleMonitorIdx].pModeList[ModeIndex].VSync,
 											   IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR);
 				}
 
 				// Set the preferred mode as represented in the EDID
-				pOutArgs->PreferredMonitorModeIdx = s_SampleMonitors[SampleMonitorIdx].ulPreferredModeIdx;
+				pOutArgs->PreferredMonitorModeIdx = g_monitors[SampleMonitorIdx].ulPreferredModeIdx;
 				return STATUS_SUCCESS;
 			}
 		}
-		DBGPRINT("DVServerUMDParseMonitorDescription NOT FOUND");
+
 		// This EDID block does not belong to the monitors we reported earlier
 		return STATUS_INVALID_PARAMETER;
 	}
@@ -1555,6 +1512,7 @@ _Use_decl_annotations_ NTSTATUS DVServerUMDMonitorGetDefaultModes(IDDCX_MONITOR 
 																  const IDARG_IN_GETDEFAULTDESCRIPTIONMODES *pInArgs,
 																  IDARG_OUT_GETDEFAULTDESCRIPTIONMODES *pOutArgs)
 {
+	UNREFERENCED_PARAMETER(MonitorObject);
 	TRACING();
 
 	// ==============================
@@ -1563,27 +1521,19 @@ _Use_decl_annotations_ NTSTATUS DVServerUMDMonitorGetDefaultModes(IDDCX_MONITOR 
 	// monitors (such 640x480, 800x600, or 1024x768). If the driver has access to monitor modes from a descriptor other
 	// than an EDID, those modes would also be reported here.
 	// ==============================
-	auto *pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject);
-	UINT SampleMonitorIdx = pMonitorContextWrapper->pContext->m_MonitorIndex;
+
 	if (pInArgs->DefaultMonitorModeBufferInputCount == 0) {
-		pOutArgs->DefaultMonitorModeBufferOutputCount = g_monitors[SampleMonitorIdx].currentModeList;
-		DBGPRINT("DVServerUMDMonitorGetDefaultModes notfound");
+		pOutArgs->DefaultMonitorModeBufferOutputCount = ARRAYSIZE(s_SampleDefaultModes);
 	} else {
-
-		DBGPRINT("DVServerUMDMonitorGetDefaultModes found mon %d", SampleMonitorIdx);
-		// Copy the known modes to the output buffer
-		for (DWORD ModeIndex = 0; ModeIndex < (DWORD) min(g_monitors[SampleMonitorIdx].currentModeList, pInArgs->DefaultMonitorModeBufferInputCount ); ModeIndex++) {
-
-				pInArgs->pDefaultMonitorModes[ModeIndex] =
-					CreateIddCxMonitorMode(g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Width,
-										   g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Height,
-										   g_monitors[SampleMonitorIdx].pModeList[ModeIndex].VSync);
-			
+		for (DWORD ModeIndex = 0; ModeIndex < ARRAYSIZE(s_SampleDefaultModes); ModeIndex++) {
+			pInArgs->pDefaultMonitorModes[ModeIndex] =
+				CreateIddCxMonitorMode(s_SampleDefaultModes[ModeIndex].Width, s_SampleDefaultModes[ModeIndex].Height,
+									   s_SampleDefaultModes[ModeIndex].VSync, IDDCX_MONITOR_MODE_ORIGIN_DRIVER);
 		}
-		pOutArgs->DefaultMonitorModeBufferOutputCount = min(g_monitors[SampleMonitorIdx].currentModeList, pInArgs->DefaultMonitorModeBufferInputCount );
-		
+
+		pOutArgs->DefaultMonitorModeBufferOutputCount = ARRAYSIZE(s_SampleDefaultModes);
+		pOutArgs->PreferredMonitorModeIdx = 0;
 	}
-	pOutArgs->PreferredMonitorModeIdx = 0;
 
 	return STATUS_SUCCESS;
 }
@@ -1600,25 +1550,30 @@ _Use_decl_annotations_ NTSTATUS DVServerUMDMonitorQueryModes(IDDCX_MONITOR Monit
 	// Create a set of modes supported for frame processing and scan-out. These are typically not based on the
 	// monitor's descriptor and instead are based on the static processing capability of the device. The OS will
 	// report the available set of modes for a given output as the intersection of monitor modes with target modes.
-	auto *pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject);
-	UINT SampleMonitorIdx = pMonitorContextWrapper->pContext->m_MonitorIndex;
 
-	DBGPRINT("DVServerUMDMonitorQueryModes found mon %d", SampleMonitorIdx);
-	// Copy the known modes to the output buffer
-	for (DWORD ModeIndex = 0; ModeIndex < g_monitors[SampleMonitorIdx].currentModeList; ModeIndex++) {
-		if (SampleMonitorIdx < dvserver_monitor_count) {
-			TargetModes.push_back(
-				CreateIddCxTargetMode(g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Width,
-										g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Height,
-										g_monitors[SampleMonitorIdx].pModeList[ModeIndex].VSync));
+	DWORD SampleMonitorIdx = 0;
+	for (SampleMonitorIdx = 0; SampleMonitorIdx < dvserver_monitor_count; SampleMonitorIdx++) {
+		if (memcmp(pInArgs->MonitorDescription.pData, g_monitors[SampleMonitorIdx].pEdidBlock,
+				   IndirectSampleMonitor::szEdidBlock) == 0) {
+			// Copy the known modes to the output buffer
+			for (DWORD ModeIndex = 0; ModeIndex < IndirectSampleMonitor::szModeList; ModeIndex++) {
+				if (SampleMonitorIdx < dvserver_monitor_count) {
+					TargetModes.push_back(
+						CreateIddCxTargetMode(g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Width,
+											  g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Height,
+											  g_monitors[SampleMonitorIdx].pModeList[ModeIndex].VSync));
+				}
+			}
+			pOutArgs->TargetModeBufferOutputCount = (UINT)TargetModes.size();
+			if (pInArgs->TargetModeBufferInputCount >= TargetModes.size()) {
+				copy(TargetModes.begin(), TargetModes.end(), pInArgs->pTargetModes);
+			}
+			return STATUS_SUCCESS;
 		}
 	}
-	pOutArgs->TargetModeBufferOutputCount = (UINT)g_monitors[SampleMonitorIdx].currentModeList;
-	if (pInArgs->TargetModeBufferInputCount >= TargetModes.size()) {
-		copy(TargetModes.begin(), TargetModes.end(), pInArgs->pTargetModes);
-	}
-	return STATUS_SUCCESS;
-		
+
+	// This EDID block does not belong to the monitors we reported earlier
+	return STATUS_INVALID_PARAMETER;
 }
 
 _Use_decl_annotations_ NTSTATUS DVServerUMDMonitorAssignSwapChain(IDDCX_MONITOR MonitorObject,
@@ -1636,9 +1591,6 @@ _Use_decl_annotations_ NTSTATUS DVServerUMDMonitorUnassignSwapChain(IDDCX_MONITO
 	pMonitorContextWrapper->pContext->UnassignSwapChain();
 	return STATUS_SUCCESS;
 }
-
-
-// Debug helper for IDDCX_TARGET_MODE (Used in path/pipeline resolution matching)
 VOID DebugPrintTargetMode(char* prefix, const IDDCX_TARGET_MODE& mode)
 {
     DBGPRINT( 
@@ -1659,7 +1611,6 @@ VOID DebugPrintTargetMode(char* prefix, const IDDCX_TARGET_MODE& mode)
 			   mode.TargetVideoSignalInfo.targetVideoSignalInfo.hSyncFreq.Numerator,
 			   mode.TargetVideoSignalInfo.targetVideoSignalInfo.hSyncFreq.Denominator);
 }
-
 /*******************************************************************************
  *
  * Description
@@ -1710,6 +1661,7 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 		ERR("Cannot create HOTPULG event!\n");
 		return DVSERVERUMD_FAILURE;
 	}
+	//SetEvent(hp_event);
 	hdata.event = hp_event;
 
 	hp_terminate_event = CreateEvent(&hp_sa, FALSE, FALSE, HOTPLUG_TERMINATE_EVENT);
