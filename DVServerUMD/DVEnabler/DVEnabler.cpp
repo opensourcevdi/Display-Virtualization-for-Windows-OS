@@ -246,38 +246,21 @@ int GetDisplayCount(disp_info *pdinfo)
 
 int IsSystemLocked()
 {
-	FILE *fp;
-	char buffer[128];
-	int status = TRUE;
-
-	// Run the PowerShell command to get the system lock status
-	fp =
-		_popen("powershell.exe -WindowStyle Hidden -Command \"(quser 2>$null) -and (get-process logonui -ea 0)\"", "r");
-	if (fp == NULL) {
-		ERR("Failed to run PowerShell command.\n");
-		return DVENABLER_FAILURE;
-	}
-
-	// Read the output of the PowerShell command
-	while (fgets(buffer, sizeof(buffer), fp) != NULL) {
-		// Check if the output is "true" (indicating locked) and act accordingly
-		if (strstr(buffer, "True") != NULL) {
+    HDESK hDesk = OpenInputDesktop(0, FALSE, DESKTOP_SWITCHDESKTOP);
+    if (hDesk == NULL) 
+    {
+        // If OpenInputDesktop fails with Access Denied while a user is logged in, 
+        // it typically means the lock screen (LogonUI) is active.
+        if (GetLastError() == ERROR_ACCESS_DENIED) 
+        {
 			DBGPRINT("System is locked\n");
-			status = TRUE;
-		} else if (strstr(buffer, "False") != NULL) {
-			DBGPRINT("System is unlocked\n");
-			status = FALSE;
-		} else {
-			ERR("Unexpected output\n");
-			status = DVENABLER_FAILURE;
-		}
-	}
-
-	// Close the pipe and print any errors
-	if (_pclose(fp) != 0) {
-		ERR("Error occurred while running PowerShell command.\n");
-		return DVENABLER_FAILURE;
-	}
-
-	return status;
+            return TRUE;
+        }
+		ERR("Unexpected output\n");
+        return DVENABLER_FAILURE;
+    }
+    
+    CloseDesktop(hDesk);
+	DBGPRINT("System is unlocked\n");
+    return FALSE;
 }
