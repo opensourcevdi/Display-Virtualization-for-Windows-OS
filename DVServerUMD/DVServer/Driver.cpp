@@ -56,10 +56,10 @@ IndirectSampleMonitor *g_monitors = NULL;
 // Default modes reported for edid-less monitors. The first mode is set as preferred
 static const struct IndirectSampleMonitor::SampleMonitorMode s_SampleDefaultModes[] = {
 	{1920, 1080, 60},
-	{1600, 900, 60},
-	{1024, 768, 75},
+	{1600, 1200, 60},
+	{1280, 768, 60},
+	{1024, 768, 60},
 };
-
 IDDCX_MONITOR g_DvserverCxMonitorObject[MAX_SCAN_OUT] = {0};
 IDARG_IN_QUERY_HWCURSOR g_inputargs[MAX_SCAN_OUT] = {0};
 Microsoft::WRL::Wrappers::Event g_dvserver_cursor_os_event[MAX_SCAN_OUT];
@@ -112,6 +112,15 @@ static IDDCX_TARGET_MODE CreateIddCxTargetMode(DWORD Width, DWORD Height, DWORD 
 
 	Mode.Size = sizeof(Mode);
 	FillSignalInfo(Mode.TargetVideoSignalInfo.targetVideoSignalInfo, Width, Height, VSync, false);
+
+	return Mode;
+}
+static IDDCX_TARGET_MODE CreateIddCxTargetMode2(DWORD Width, DWORD Height, DWORD VSync)
+{
+	IDDCX_TARGET_MODE Mode = {};
+
+	Mode.Size = sizeof(Mode);
+	FillSignalInfo(Mode.TargetVideoSignalInfo.targetVideoSignalInfo, Width, Height, VSync, true);
 
 	return Mode;
 }
@@ -901,6 +910,9 @@ int SwapChainProcessor::GetFrameData(std::shared_ptr<Direct3DDevice> dvserver_de
 		m_staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 		m_staging_desc.MiscFlags = 0;
 
+		g_monitors[m_screen_num].current_Width = m_staging_desc.Width;
+		g_monitors[m_screen_num].current_Height = m_staging_desc.Height;
+
 		DBGPRINT("New mode info: %dx%d\n", m_staging_desc.Width, m_staging_desc.Height);
 
 		/* Check if all the parameters in the staging descriptor is proper or not */
@@ -1256,6 +1268,18 @@ void IndirectDeviceContext::InitAdapter(WDF_POWER_DEVICE_STATE PreviousState)
 	}
 }
 
+GUID GetStableMonitorContainerId(UINT ConnectorIndex)
+{
+    // Pick your own fixed GUID here (generate one once, hardcode it — this is
+    // just a namespace so your driver's container IDs don't collide with anyone else's)
+    static const GUID Namespace =
+    { 0x12345678, 0x1234, 0x5678, { 0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78 } };
+
+    GUID Id = Namespace;
+    Id.Data1 ^= ConnectorIndex;   // fold in the connector index deterministically
+    return Id;
+}
+
 void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
 {
 	// ==============================
@@ -1283,7 +1307,7 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
 		MonitorInfo.MonitorDescription.DataSize = 0;
 		MonitorInfo.MonitorDescription.pData = nullptr;
 	} else {
-		MonitorInfo.MonitorDescription.DataSize = IndirectSampleMonitor::szEdidBlock;
+	 	MonitorInfo.MonitorDescription.DataSize = IndirectSampleMonitor::szEdidBlock;
 		MonitorInfo.MonitorDescription.pData = const_cast<BYTE *>(g_monitors[ConnectorIndex].pEdidBlock);
 	}
 
@@ -1294,9 +1318,10 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
 	// sample we generate a random container ID GUID, but it's best practice to choose a stable container ID for a
 	// unique monitor or to use "this" device's container ID for a permanent/integrated monitor.
 	// ==============================
+	GUID cid = GetStableMonitorContainerId(ConnectorIndex);
+	DBGPRINT("ConnectorIndex=%u ContainerId=%!GUID!", ConnectorIndex, & cid);
+	MonitorInfo.MonitorContainerId = cid;
 
-	// Create a container ID
-	CoCreateGuid(&MonitorInfo.MonitorContainerId);
 
 	IDARG_IN_MONITORCREATE MonitorCreate = {};
 	MonitorCreate.ObjectAttributes = &Attr;
@@ -1453,7 +1478,7 @@ _Use_decl_annotations_ NTSTATUS DVServerUMDAdapterCommitModes(IDDCX_ADAPTER Adap
 {
 	UNREFERENCED_PARAMETER(AdapterObject);
 	UNREFERENCED_PARAMETER(pInArgs);
-
+	TRACING();
 	// For the sample, do nothing when modes are picked - the swap-chain is taken care of by IddCx
 
 	// ==============================
@@ -1495,9 +1520,9 @@ _Use_decl_annotations_ NTSTATUS DVServerUMDParseMonitorDescription(const IDARG_I
 					pInArgs->pMonitorModes[ModeIndex] =
 						CreateIddCxMonitorMode(g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Width,
 											   g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Height,
-											   g_monitors[SampleMonitorIdx].pModeList[ModeIndex].VSync,
-											   IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR);
-				}
+											g_monitors[SampleMonitorIdx].pModeList[ModeIndex].VSync,
+IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR);
+						}
 
 				// Set the preferred mode as represented in the EDID
 				pOutArgs->PreferredMonitorModeIdx = g_monitors[SampleMonitorIdx].ulPreferredModeIdx;
@@ -1573,7 +1598,7 @@ _Use_decl_annotations_ NTSTATUS DVServerUMDMonitorQueryModes(IDDCX_MONITOR Monit
 			return STATUS_SUCCESS;
 		}
 	}
-
+	
 	// This EDID block does not belong to the monitors we reported earlier
 	return STATUS_INVALID_PARAMETER;
 }
@@ -1710,8 +1735,8 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 		return DVSERVERUMD_FAILURE;
 	}
 
-	pSharedMem->mutex = CreateMutex(&secAttr, FALSE, NULL);
-	if (pSharedMem->mutex == NULL) {
+	HANDLE hMutex = CreateMutexW(&secAttr, FALSE, L"Global\\DVEnablerMutex");
+	if (hMutex == NULL) {
 		ERR(L"Failed to create mutex for shared memeory (%d)\n", GetLastError());
 		UnmapViewOfFile(pSharedMem);
 		CloseHandle(hSharedMem);
@@ -1720,7 +1745,7 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 		CloseHandle(dve_event);
 		return DVSERVERUMD_FAILURE;
 	}
-
+	DBGPRINT("UMD Mutex permanently locked into global memory space.\n");
 	isWin11 = IsWindows11OrLater();
 	DBGPRINT("OS Version is %s, using %s EDID", isWin11 ? "WIN11" : "WIN10", isWin11 ? "realtime" : "default");
 
@@ -1732,9 +1757,9 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 	pDeviceContextWrapper->pContext->FinishInit(PRIMARY_IDD_INDEX);
 
 	// Default IDD monitor will be enabled at this time. so setting disp_count to 1.
-	WaitForSingleObject(pSharedMem->mutex, INFINITE);
+	WaitForSingleObject(hMutex, INFINITE);
 	pSharedMem->disp_count = 1;
-	ReleaseMutex(pSharedMem->mutex);
+	ReleaseMutex(hMutex);
 
 	// Doing this set event to avoid dead lock during UMD driver reset.
 	status = SetEvent(dve_event);
@@ -1760,7 +1785,7 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 				ERR("HotPlug resource allocation failed... Going back to the loop again");
 				continue;
 			}
-
+			hdata.screen_present[1] = {1};
 			// call display arrival and departure based on previous and current display state.
 			for (count = 0; count < MAX_SCAN_OUT; count++) {
 
@@ -1786,6 +1811,14 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 						DBGPRINT("call finishinit for DISPLAY = %d\n", count);
 						pDeviceContextWrapper->pContext->FinishInit(count);
 						dinfo.disp_count++;
+						WaitForSingleObject(hMutex, INFINITE);
+						pSharedMem->disp_target_res[count].cx = g_monitors[count].pModeList[0].Width;
+						pSharedMem->disp_target_res[count].cy = g_monitors[count].pModeList[0].Height;
+						pSharedMem->disp_target_res[count].refresh = g_monitors[count].pModeList[0].VSync;
+						pSharedMem->disp_target_res[count].set = true;
+						pSharedMem->disp_target_res[count].enabled = true;
+						DBGPRINT("Set new res on connect for %d: %d x %d @ %dHz\n", count, pSharedMem->disp_target_res[count].cx, pSharedMem->disp_target_res[count].cy, pSharedMem->disp_target_res[count].refresh);
+						ReleaseMutex(hMutex);
 					}
 					do_set_event = TRUE;
 				} else if (hdata.screen_present[count]) {
@@ -1802,33 +1835,82 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 						memset(minfo[count].pEdidBlock, 0, minfo[count].szEdidBlock);
 						memcpy_s(minfo[count].pEdidBlock, minfo->szEdidBlock, g_monitors[count].pEdidBlock,
 								 minfo->szEdidBlock);
+						//unsigned char *edid = minfo[count].pEdidBlock;
+						//int w = ((edid[0x36 + 4] >> 4) << 8) | edid[0x36 + 2], h = ((edid[0x36 + 7] >> 4) << 8) | edid[0x36 + 5];
 
-						unsigned char *edid = minfo[count].pEdidBlock;
-						int w = ((edid[0x36 + 4] >> 4) << 8) | edid[0x36 + 2], h = ((edid[0x36 + 7] >> 4) << 8) | edid[0x36 + 5];
+						// struct { int Width, Height; } Modes[] = {
+						// 	{(int) g_monitors[count].pModeList[0].Width, (int) g_monitors[count].pModeList[0].Height},
+						// 	 {1920, 1080},
+						// 	 {1280, 768},
+						// 	 {1024, 768},
 
-						struct { int Width, Height; } Modes[] = {
-							{w, h},
-						};
-						UINT ModeCount = sizeof(Modes) / sizeof(Modes[0]);
+						// };
+
+							//DBGPRINT("Mode_count: %d, Edid width: %d = %d, height: %d = %d\n", g_monitors[count].modes_count, w, Modes[0].Width, h, Modes[0].Height);
+						UINT ModeCount = g_monitors[count].modes_count; //(UINT)g_monitors[count].modes_count;
 
 						// See https://github.com/rustdesk-org/RustDeskIddDriver/blob/17ddb6eb9c6f1742453ef00279b4bb07496e0bbe/RustDeskIddDriver/Driver.cpp#L970
-						IDDCX_TARGET_MODE* PTargetMode = (IDDCX_TARGET_MODE*)malloc(sizeof(IDDCX_TARGET_MODE) * ModeCount);
+						IDDCX_TARGET_MODE* PTargetMode = (IDDCX_TARGET_MODE*)malloc(sizeof(IDDCX_TARGET_MODE) * (ModeCount));
 						for (UINT i = 0; i < ModeCount; ++i)
 						{
 							PTargetMode[i] = CreateIddCxTargetMode(
-								Modes[i].Width,
-								Modes[i].Height,
-								60);
+								(int) g_monitors[count].pModeList[i].Width,
+								(int) g_monitors[count].pModeList[i].Height,
+								(int) g_monitors[count].pModeList[i].VSync);
+							DBGPRINT("Mode %d: %d x %d @ %dHz\n", i, g_monitors[count].pModeList[i].Width, g_monitors[count].pModeList[i].Height, g_monitors[count].pModeList[i].VSync);
 						}
+					
+
+						// PTargetMode[1] = CreateIddCxTargetMode(
+						//  		g_monitors[count].current_Width,
+						//  		g_monitors[count].current_Height,
+						//  		60);
+						//DBGPRINT("Current mode: %d x %d\n", g_monitors[count].current_Width, g_monitors[count].current_Height);
+						
+						
+
+						// TODO disable MonitorPath 
+						/*/
+						WaitForSingleObject(hMutex, INFINITE);
+						pSharedMem->disp_target_res[count].enabled = false;
+						pSharedMem->disp_target_res[count].set = true;
+						ReleaseMutex(hMutex);
+						DBGPRINT("Disabled monitor path for display %d\n", count);
+						status = SetEvent(dve_event);
+
+						waitstatus = WaitForMultipleObjects(ARRAYSIZE(hp_handles), hp_handles, FALSE, INFINITE);
+						if (waitstatus != WAIT_OBJECT_0) {
+							ERR("HPD Wait was either cancelled or something unexpected happened");
+							goto end;
+						}
+						// Sleep(500);*/
 						IDARG_IN_UPDATEMODES UpdateModes{ IDDCX_UPDATE_REASON_OTHER, ModeCount, PTargetMode };
 						NTSTATUS Status = IddCxMonitorUpdateModes(g_monitorobject_list[count], &UpdateModes);
+						DBGPRINT("IddCxMonitorUpdateModes returned 0x%X\n", Status);
+						if (!NT_SUCCESS(Status)) {
+							DBGPRINT("IddCxMonitorUpdateModes Failed");
+						}
 						free(PTargetMode);
+						// Sleep(500);
+
+						// TODO enable and set res
+						// WaitForSingleObject(hMutex, INFINITE);
+						// pSharedMem->disp_target_res[count].cx = g_monitors[count].pModeList[0].Width;
+						// pSharedMem->disp_target_res[count].cy = g_monitors[count].pModeList[0].Height;
+						// pSharedMem->disp_target_res[count].refresh = g_monitors[count].pModeList[0].VSync;
+						// pSharedMem->disp_target_res[count].set = true;
+						// pSharedMem->disp_target_res[count].enabled = true;
+						// DBGPRINT("Set new res for %d: %d x %d @ %dHz\n", count, pSharedMem->disp_target_res[count].cx, pSharedMem->disp_target_res[count].cy, pSharedMem->disp_target_res[count].refresh);
+						// ReleaseMutex(hMutex);
+						
+						// status = SetEvent(dve_event);
+
 
 						// Remove the display and connect it again with fresh EDID
 						// IddCxMonitorDeparture(g_monitorobject_list[count]);
 						// g_monitorobject_list[count] = NULL;
 						// pDeviceContextWrapper->pContext->FinishInit(count);
-						// do_set_event = TRUE;
+						 do_set_event = TRUE;
 					} else {
 						DBGPRINT("No changes in DISPLAY = %d\n", count);
 					}
@@ -1840,9 +1922,20 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 
 			if ((do_set_event)) {
 				DBGPRINT("disp_count = %d", dinfo.disp_count);
-				WaitForSingleObject(pSharedMem->mutex, INFINITE);
+				WaitForSingleObject(hMutex, INFINITE);
+				for (count = 0; count < MAX_SCAN_OUT; count++) {
+					if(hdata.screen_present[count]){
+						pSharedMem->disp_target_res[count].cx = g_monitors[count].pModeList[0].Width;
+						pSharedMem->disp_target_res[count].cy = g_monitors[count].pModeList[0].Height;
+						pSharedMem->disp_target_res[count].refresh = g_monitors[count].pModeList[0].VSync;
+						pSharedMem->disp_target_res[count].set = true;
+						pSharedMem->disp_target_res[count].enabled = true;
+						DBGPRINT("Set new res for %d: %d x %d @ %dHz\n", count, pSharedMem->disp_target_res[count].cx, pSharedMem->disp_target_res[count].cy, pSharedMem->disp_target_res[count].refresh);
+					}
+				}
 				pSharedMem->disp_count = dinfo.disp_count;
-				ReleaseMutex(pSharedMem->mutex);
+				ReleaseMutex(hMutex);
+				DBGPRINT("SetEvent(dve_event)");
 				status = SetEvent(dve_event);
 				if (status == NULL) {
 					ERR("Set dve-event failed during Display Arrival/departure with error [%d]\n ", GetLastError());
@@ -1858,6 +1951,7 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 			break;
 		}
 	}
+//end:
 
 	for (count = 0; count < MAX_SCAN_OUT; count++) {
 		if (hdata.screen_present[count]) {

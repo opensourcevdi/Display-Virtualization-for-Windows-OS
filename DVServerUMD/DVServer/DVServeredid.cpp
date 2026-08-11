@@ -17,7 +17,12 @@ PSP_DEVICE_INTERFACE_DETAIL_DATA device_iface_edid_data;
 struct edid_info *edata = NULL;
 struct screen_info *mdata = NULL;
 ULONG bytesReturned = 0;
-
+static const struct IndirectSampleMonitor::SampleMonitorMode s_SampleDefaultModes[] = {
+	{1920, 1080, 60},
+	{1600, 1200, 60},
+	{1280, 768, 60},
+	{1024, 768, 60},
+};
 unsigned int blacklisted_resolution_list[][2] = {{1400, 1050}}; // blacklisted resolution can be appended here
 
 /*******************************************************************************
@@ -123,7 +128,10 @@ int get_edid_data(HANDLE devHandle, void *m, DWORD id, BOOL d_edid)
 					 monitor->pModeList[edid_mode_index].Height, monitor->pModeList[edid_mode_index].VSync);
 			edid_mode_index++;
 		}
+		
 	}
+    monitor->modes_count = edid_mode_index;
+
 
 	free(edata);
 	return DVSERVERUMD_SUCCESS;
