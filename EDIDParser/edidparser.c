@@ -55,10 +55,10 @@ int parse_edid_data(unsigned char *edid_data, struct output_modelist *kmd_modeli
 		return func_result;
 	}
 
+	get_detailed_timing_descriptor_modes(edid_data, kmd_modelist);
 	get_timing_bitmaps_modes(edid_data, kmd_modelist);
 	get_standard_modes(edid_data, kmd_modelist);
 	get_cea_modes(edid_data, kmd_modelist);
-	get_detailed_timing_descriptor_modes(edid_data, kmd_modelist);
 	get_additional_standard_display_modes(edid_data, kmd_modelist);
 	return 0;
 }
