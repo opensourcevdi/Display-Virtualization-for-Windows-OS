@@ -124,7 +124,7 @@ int get_edid_data(HANDLE devHandle, void *m, DWORD id, BOOL d_edid)
 			edid_mode_index++;
 		}
 	}
-
+	monitor->modes_count = edid_mode_index;
 	free(edata);
 	return DVSERVERUMD_SUCCESS;
 }

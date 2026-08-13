@@ -14,25 +14,246 @@
 #include <Windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <string>
+#include <initguid.h> 
+#include <Setupapi.h>
+#include <Ntddvdeo.h>
+#include <Devpkey.h>
 #include "Trace_override.h"
 
-int dvenabler_init()
+bool operator==(const LUID &a, const LUID &b) { return a.LowPart == b.LowPart && a.HighPart == b.HighPart; }
+
+
+struct DisplayConfigState
 {
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+};
+
+static bool QueryCurrentDisplayConfig(DisplayConfigState& state)
+{
+    UINT32 pathCount = 0, modeCount = 0;
+    LONG result;
+
+    // Retry loop: topology can change between the size query and the real query
+    do
+    {
+        if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
+        {
+            ERR("GetDisplayConfigBufferSizes failed\n");
+            return false;
+        }
+
+        state.paths.resize(pathCount);
+        state.modes.resize(modeCount);
+
+        result = QueryDisplayConfig(QDC_ALL_PATHS, &pathCount, state.paths.data(),
+                                     &modeCount, state.modes.data(), nullptr);
+    } while (result == ERROR_INSUFFICIENT_BUFFER);
+
+    if (result != ERROR_SUCCESS)
+    {
+        ERR("QueryDisplayConfig failed with %ld\n", result);
+        return false;
+    }
+
+    state.paths.resize(pathCount);
+    state.modes.resize(modeCount);
+    return true;
+}
+
+
+static bool StageDisplayChange(DisplayConfigState& state, const std::wstring& devicePath,
+                                    const disp_target_res* target_res, bool disable = false, bool zero_pos = false)
+{
+    UINT32 pathCount = (UINT32)state.paths.size();
+
+    for (UINT32 i = 0; i < pathCount; i++)
+    {
+        DISPLAYCONFIG_TARGET_DEVICE_NAME name = {};
+        name.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        name.header.size = sizeof(name);
+        name.header.adapterId = state.paths[i].targetInfo.adapterId;
+        name.header.id = state.paths[i].targetInfo.id;
+
+        if (DisplayConfigGetDeviceInfo(&name.header) != ERROR_SUCCESS)
+            continue;
+
+        if (_wcsicmp(name.monitorDevicePath, devicePath.c_str()) != 0)
+            continue;
+
+		if(disable)
+		{
+			state.paths[i].flags = 0;
+			return true;
+		}
+
+		if (target_res == nullptr) {
+			ERR("Target resolution is null for connector %ws\n", devicePath.c_str());
+			return false;
+		}
+
+        UINT32 srcIdx = state.paths[i].sourceInfo.modeInfoIdx;
+        UINT32 tgtIdx = state.paths[i].targetInfo.modeInfoIdx;
+
+        // Reuse an existing source mode if another path already shares this source
+        UINT32 existingSrcIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+        for (UINT32 k = 0; k < pathCount; k++)
+        {
+            if (k == i) continue;
+            if (state.paths[k].sourceInfo.adapterId.LowPart  == state.paths[i].sourceInfo.adapterId.LowPart &&
+                state.paths[k].sourceInfo.adapterId.HighPart == state.paths[i].sourceInfo.adapterId.HighPart &&
+                state.paths[k].sourceInfo.id == state.paths[i].sourceInfo.id &&
+                state.paths[k].sourceInfo.modeInfoIdx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID)
+            {
+                existingSrcIdx = state.paths[k].sourceInfo.modeInfoIdx;
+                break;
+            }
+        }
+
+        if (existingSrcIdx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID)
+        {
+            srcIdx = existingSrcIdx;
+            state.paths[i].sourceInfo.modeInfoIdx = srcIdx;
+        }
+        else if (srcIdx == DISPLAYCONFIG_PATH_MODE_IDX_INVALID)
+        {
+            DISPLAYCONFIG_MODE_INFO srcModeInfo = {};
+            srcModeInfo.infoType  = DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE;
+            srcModeInfo.adapterId = state.paths[i].sourceInfo.adapterId;
+            srcModeInfo.id        = state.paths[i].sourceInfo.id;
+            state.modes.push_back(srcModeInfo);
+            srcIdx = (UINT32)state.modes.size() - 1;
+            state.paths[i].sourceInfo.modeInfoIdx = srcIdx;
+        }
+
+        if (tgtIdx == DISPLAYCONFIG_PATH_MODE_IDX_INVALID)
+        {
+            DISPLAYCONFIG_MODE_INFO tgtModeInfo = {};
+            tgtModeInfo.infoType  = DISPLAYCONFIG_MODE_INFO_TYPE_TARGET;
+            tgtModeInfo.adapterId = state.paths[i].targetInfo.adapterId;
+            tgtModeInfo.id        = state.paths[i].targetInfo.id;
+            state.modes.push_back(tgtModeInfo);
+            tgtIdx = (UINT32)state.modes.size() - 1;
+            state.paths[i].targetInfo.modeInfoIdx = tgtIdx;
+        }
+
+        // Fetch refs AFTER the push_back calls above — push_back can reallocate
+        auto& srcMode = state.modes[srcIdx].sourceMode;
+        srcMode.width       = target_res->cx;
+        srcMode.height      = target_res->cy;
+        srcMode.pixelFormat = DISPLAYCONFIG_PIXELFORMAT_32BPP;
+        if(zero_pos)
+        {
+            srcMode.position.x = 0;
+            srcMode.position.y = 0;
+        }
+
+
+        FillSignalInfo(state.modes[tgtIdx].targetMode.targetVideoSignalInfo,
+                        target_res->cx, target_res->cy, target_res->refresh);
+        state.paths[i].flags |= DISPLAYCONFIG_PATH_ACTIVE;
+
+        return true;
+        
+    }
+
+    ERR("No matching path found for ConnectorIndex %ws\n", devicePath.c_str());
+    return false;
+}
+
+
+
+
+bool IterateDisplays(const disp_info& dinfo)
+{
+	DisplayConfigState state;
+    if (!QueryCurrentDisplayConfig(state))
+        return false;
+    HDEVINFO devInfo = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_MONITOR, nullptr, nullptr,
+        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (devInfo == INVALID_HANDLE_VALUE) return false;
+
+    SP_DEVICE_INTERFACE_DATA ifData = {};
+    ifData.cbSize = sizeof(ifData);
+	bool anyStaged = false;
+    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(devInfo, nullptr, &GUID_DEVINTERFACE_MONITOR, i, &ifData); i++)
+    {
+        SP_DEVINFO_DATA devInfoData = {};
+        devInfoData.cbSize = sizeof(devInfoData);
+
+        DWORD requiredSize = 0;
+        SetupDiGetDeviceInterfaceDetailW(devInfo, &ifData, nullptr, 0, &requiredSize, &devInfoData);
+        if (requiredSize == 0) continue;
+
+        std::vector<BYTE> buffer(requiredSize);
+        auto* detail = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(buffer.data());
+        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+        if (!SetupDiGetDeviceInterfaceDetailW(devInfo, &ifData, detail, requiredSize, nullptr, &devInfoData))
+            continue;
+
+        GUID containerId;
+        DEVPROPTYPE propType;
+        if (SetupDiGetDevicePropertyW(devInfo, &devInfoData, &DEVPKEY_Device_ContainerId,
+                &propType, reinterpret_cast<PBYTE>(&containerId), sizeof(containerId), nullptr, 0)
+		    ) {
+		    bool isIdd = false;
+			for (int connectorIndex = 0; connectorIndex < 4; connectorIndex++) {
+				GUID id = GetStableMonitorContainerId(connectorIndex);
+				if (IsEqualGUID(containerId, id)) {
+					DBGPRINT("Found device path for connector index %d: %ws\n", connectorIndex, detail->DevicePath);
+					isIdd = true;
+					if(dinfo.disp_target_res[connectorIndex].set && dinfo.disp_target_res[connectorIndex].enabled){
+   				    	anyStaged |= StageDisplayChange(state,  detail->DevicePath, &dinfo.disp_target_res[connectorIndex],false, connectorIndex == 0);
+					}
+ 					break;
+				}
+			}
+			if(isIdd == false) {
+				// disable non-IDD displays aka MSFT display
+				DBGPRINT("Disabling non-IDD display: %ws\n", detail->DevicePath);
+				anyStaged |= StageDisplayChange(state,  detail->DevicePath, nullptr, true);
+			}
+		}
+
+	
+    }
+    SetupDiDestroyDeviceInfoList(devInfo);
+
+	if (!anyStaged)
+        return false;
+	LONG result = SetDisplayConfig(
+        (UINT32)state.paths.size(), state.paths.data(),
+        (UINT32)state.modes.size(), state.modes.data(),
+        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+
+    if (result != ERROR_SUCCESS)
+    {
+        ERR("SetDisplayConfig failed with %ld\n", result);
+        return false;
+    }
+
+	return true;
+}
+
+extern "C" __declspec(dllexport) void CALLBACK dvenabler_init(
+    HWND hwnd,        // Handle to owner window
+    HINSTANCE hinst,  // Instance handle of the DLL
+    LPSTR lpszCmdLine,// Command line string
+    int nCmdShow      // Window show state
+){
+	UNREFERENCED_PARAMETER(hwnd);
+	UNREFERENCED_PARAMETER(hinst);
+	UNREFERENCED_PARAMETER(lpszCmdLine);
+	UNREFERENCED_PARAMETER(nCmdShow);
 	WPP_INIT_TRACING(NULL);
 	TRACING();
 	DBGPRINT("DVenabler init dve_event\n");
-	DISPLAYCONFIG_TARGET_BASE_TYPE baseType;
 	HANDLE hp_event = NULL;
 	HANDLE dve_event = NULL;
-	char err[256];
-	memset(err, 0, 256);
 	int status;
-	unsigned int path_count = NULL, mode_count = NULL;
-	bool found_id_path = FALSE, found_non_id_path = FALSE;
 	disp_info dinfo = {0};
-	/* Initializing the baseType.baseOutputTechnology to default OS value(failcase) */
-	baseType.baseOutputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER;
-
 	// Create Security Descriptor for HOTPLUG_EVENT, To allow the DVServerUMD to access the event
 	PSECURITY_DESCRIPTOR hp_psd = (PSECURITY_DESCRIPTOR)LocalAlloc(LPTR, SECURITY_DESCRIPTOR_MIN_LENGTH);
 	InitializeSecurityDescriptor(hp_psd, SECURITY_DESCRIPTOR_REVISION);
@@ -46,14 +267,14 @@ int dvenabler_init()
 	hp_event = CreateEvent(&hp_sa, FALSE, FALSE, HOTPLUG_EVENT);
 	if (NULL == hp_event) {
 		ERR("Cannot create HOTPULG event!\n");
-		return DVENABLER_FAILURE;
+		return;
 	}
-
+	DBGPRINT("HOTPLUG_EVENT created successfully\n");
 	// Create Security Descriptor for DVE_EVENT, To allow the DVServerUMD to access the event
 	PSECURITY_DESCRIPTOR dve_psd = (PSECURITY_DESCRIPTOR)LocalAlloc(LPTR, SECURITY_DESCRIPTOR_MIN_LENGTH);
 	InitializeSecurityDescriptor(dve_psd, SECURITY_DESCRIPTOR_REVISION);
 	SetSecurityDescriptorDacl(dve_psd, TRUE, NULL, FALSE);
-
+	DBGPRINT("Security Descriptor created successfully\n");
 	SECURITY_ATTRIBUTES dve_sa = {0};
 	dve_sa.nLength = sizeof(dve_sa);
 	dve_sa.lpSecurityDescriptor = dve_psd;
@@ -63,112 +284,24 @@ int dvenabler_init()
 	if (NULL == dve_event) {
 		ERR("Cannot create DVE event!\n");
 		CloseHandle(hp_event);
-		return DVENABLER_FAILURE;
+		return;
 	}
 
+	DBGPRINT("Pre Loop");
+	
 	while (1) {
+		DBGPRINT("Loop");
 		if (IsSystemLocked()) {
 			DBGPRINT("System is in locked state, so wait untill system gets unlocked");
 			continue;
 		}
-
-		// Reset the flags before doing QDC
-		path_count = NULL, mode_count = NULL;
-		found_id_path = FALSE, found_non_id_path = FALSE;
-
-		/* Step 0: Get the size of buffers w.r.t active paths and modes, required for QueryDisplayConfig */
-		if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) != ERROR_SUCCESS) {
-			FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, GetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-						   err, 255, NULL);
-			ERR("GetDisplayConfigBufferSizes failed with %s. Exiting!!!\n", err);
-			continue;
-		}
-
-		/* Initializing STL vectors for all the paths and its respective modes */
-		std::vector<DISPLAYCONFIG_PATH_INFO> path_list(path_count);
-		std::vector<DISPLAYCONFIG_MODE_INFO> mode_list(mode_count);
-
-		// Get the Display info shared from DVServerUMD
 		if (GetDisplayCount(&dinfo) == DVENABLER_FAILURE) {
 			ERR("shared mem read failed");
 			goto end;
 		}
-
-		/* Step 1: Retrieve information about all possible display paths for all display devices */
-		if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, path_list.data(), &mode_count, mode_list.data(),
-							   nullptr) != ERROR_SUCCESS) {
-			FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, GetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-						   err, 255, NULL);
-			ERR("QueryDisplayConfig failed with %s. Exiting!!!\n", err);
-			continue;
-		}
-
-		for (auto &activepath_loopindex : path_list) {
-			baseType.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_BASE_TYPE;
-			baseType.header.size = sizeof(baseType);
-			baseType.header.adapterId = activepath_loopindex.sourceInfo.adapterId;
-			baseType.header.id = activepath_loopindex.targetInfo.id;
-
-			/* Step 2 : DisplayConfigGetDeviceInfo function retrieves display configuration information about the device
-			 */
-			if (DisplayConfigGetDeviceInfo(&baseType.header) != ERROR_SUCCESS) {
-				ERR("DisplayConfigGetDeviceInfo failed... Continuing with other active paths!!!\n");
-				continue;
-			}
-
-			DBGPRINT("baseType.baseOutputTechnology = %d\n", baseType.baseOutputTechnology);
-			if (!(found_non_id_path && found_id_path)) {
-				/* Step 3: Check for the "outputTechnology" it should be
-				   "DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED" for IDD path ONLY, In case of MSFT display we need
-				   to disable the active display path  */
-				if (baseType.baseOutputTechnology != DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED) {
-
-					/* Step 4: Clear the DISPLAYCONFIG_PATH_INFO.flags for MSFT path*/
-					activepath_loopindex.flags = 0;
-					DBGPRINT("Clearing Microsoft activepath_loopindex.flags.\n");
-					found_non_id_path = true;
-				} else {
-					/* Move the IDD source co-ordinates to (0,0)  if MSBDA monitor is listed as first monitor in the
-					 * path list*/
-					if (found_non_id_path && !found_id_path) {
-						mode_list[activepath_loopindex.sourceInfo.modeInfoIdx].sourceMode.position.x = 0;
-						mode_list[activepath_loopindex.sourceInfo.modeInfoIdx].sourceMode.position.y = 0;
-						DBGPRINT("x, y  = %dX%x\n",
-								 mode_list[activepath_loopindex.sourceInfo.modeInfoIdx].sourceMode.position.x,
-								 mode_list[activepath_loopindex.sourceInfo.modeInfoIdx].sourceMode.position.y);
-					}
-					found_id_path = true;
-				}
-			}
-		}
-
-		if ((found_non_id_path && (path_count != static_cast<unsigned int>(dinfo.disp_count + 1))) ||
-			(!found_non_id_path && (path_count != static_cast<unsigned int>(dinfo.disp_count)))) {
-			if (found_non_id_path) {
-				DBGPRINT("MSFT display is present. Path count not updated, so loop again");
-			} else {
-				DBGPRINT("MSFT display is not present. Path count not updated, so loop again");
-			}
-			DBGPRINT("disp_count = %d, path count = %d", dinfo.disp_count, path_count);
-			continue;
-		}
-
-		if (found_non_id_path && found_id_path) {
-			/* Step 5: SetDisplayConfig modifies the display topology by exclusively enabling/disabling the specified
-					   paths in the current session. */
-			if (SetDisplayConfig(path_count, path_list.data(), mode_count, mode_list.data(),
-								 SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE) != ERROR_SUCCESS) {
-				FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, GetLastError(),
-							   MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), err, 255, NULL);
-				ERR("SetDisplayConfig failed with %s\n", err);
-				continue;
-			}
-		} else {
-			DBGPRINT("Skipping SetDisplayConfig as did not find ID and non-ID path. found_non_id_path = %d, "
-					 "found_id_path = %d\n",
-					 found_non_id_path, found_id_path);
-		}
-
+		IterateDisplays(dinfo);
+		
+	
 		/*If there is any display config change at the time of reboot / shutdown.
 		At this stage, Since the Dvenabler is not running, Changed display config will not be saved in windows
 		persistence, So at this case MSFT path will be enabled and since the DV enabler starts only after user login The
@@ -178,6 +311,7 @@ int dvenabler_init()
 		get the display status from KMD So this event is Set once after every boot to enable the HPD path in our
 		DVServer UMD driver */
 		status = SetEvent(hp_event);
+		DBGPRINT("Set HPevent status = %d\n", status);
 		if (status == NULL) {
 			ERR(" Set HPevent failed with error [%d]\n ", GetLastError());
 			continue;
@@ -187,18 +321,45 @@ int dvenabler_init()
 		// wait for arraival or departure call from UMD
 		WaitForSingleObject(dve_event, INFINITE);
 	}
+	DBGPRINT("DVenabler exiting");
 	WPP_CLEANUP();
 	CloseHandle(hp_event);
 	CloseHandle(dve_event);
 
-	return 0;
+}
+
+static void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, DWORD Width, DWORD Height, DWORD VSync)
+{
+    Mode.totalSize.cx = Mode.activeSize.cx = Width;
+    Mode.totalSize.cy = Mode.activeSize.cy = Height;
+
+    Mode.AdditionalSignalInfo.vSyncFreqDivider = 1;
+    Mode.AdditionalSignalInfo.videoStandard = 255;
+
+    Mode.vSyncFreq.Numerator = VSync;
+    Mode.vSyncFreq.Denominator = 1;
+    Mode.hSyncFreq.Numerator = VSync * Height;
+    Mode.hSyncFreq.Denominator = 1;
+
+    Mode.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
+	Mode.pixelRate =  (UINT64)VSync * (UINT64)Width * (UINT64)Height;
+}
+
+GUID GetStableMonitorContainerId(UINT ConnectorIndex)
+{
+    static const GUID Namespace =
+    { 0x7d51b9b0, 0x5eb5, 0x40ab, { 0xa5, 0x99, 0xff, 0x1c, 0x89, 0x77, 0x28, 0xb0 } };
+
+    GUID Id = Namespace;
+    Id.Data1 ^= ConnectorIndex;
+    return Id;
 }
 
 int GetDisplayCount(disp_info *pdinfo)
 {
 
 	// Open the existing shared memory section by its name
-	HANDLE hSharedMem = OpenFileMapping(FILE_MAP_READ, FALSE, DISP_INFO);
+	HANDLE hSharedMem = OpenFileMapping(FILE_MAP_ALL_ACCESS, FALSE, DISP_INFO);
 
 	if (hSharedMem == NULL) {
 		ERR("Failed to open shared memory section (%d)\n", GetLastError());
@@ -208,7 +369,7 @@ int GetDisplayCount(disp_info *pdinfo)
 	// Map the shared memory into the process's address space
 	struct disp_info *pSharedMem =
 		(struct disp_info *)MapViewOfFile(hSharedMem,	 // Handle to the shared memory section
-										  FILE_MAP_READ, // Read access
+										  FILE_MAP_ALL_ACCESS, // Read/write access
 										  0,			 // File offset - high-order DWORD
 										  0,			 // File offset - low-order DWORD
 										  0);			 // Mapping size (0 means to map the entire section)
@@ -219,15 +380,37 @@ int GetDisplayCount(disp_info *pdinfo)
 		return DVENABLER_FAILURE;
 	}
 
-	WaitForSingleObject(pSharedMem->mutex, INFINITE);
+	HANDLE hMutex = OpenMutexW(MUTEX_ALL_ACCESS, FALSE, L"Global\\DVEnablerMutex");
+    if (hMutex != NULL) {
+		DWORD rc = WaitForSingleObject(hMutex, INFINITE);
+		if (rc != WAIT_OBJECT_0 && rc != WAIT_ABANDONED)
+		{
+			ERR("WaitForSingleObject failed (%d)\n", GetLastError());
+			CloseHandle(hMutex);
+			UnmapViewOfFile(pSharedMem);
+			CloseHandle(hSharedMem);
+			return DVENABLER_FAILURE;
+		}
+	} else {
+		ERR("Failed to open mutex (%d)\n", GetLastError());
+		UnmapViewOfFile(pSharedMem);
+		CloseHandle(hSharedMem);
+		return DVENABLER_FAILURE;
+	}
 	*pdinfo = *pSharedMem;
-	ReleaseMutex(pSharedMem->mutex);
+	for (auto &disp : pSharedMem->disp_target_res)
+	{
+		disp.set = false;
+	}
+	ReleaseMutex(hMutex);
+    CloseHandle(hMutex);
 
 	UnmapViewOfFile(pSharedMem);
 	CloseHandle(hSharedMem);
 
 	return DVENABLER_SUCCESS;
 }
+
 
 /*******************************************************************************
  *
