@@ -1765,8 +1765,6 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 				continue;
 			}
 
-			// fake monitor for testing, so that IddCxMonitorUpdateModes works ?!?!
-			hdata.screen_present[1] = {1};
 			// call display arrival and departure based on previous and current display state.
 			WaitForSingleObject(hMutex, INFINITE);
 			for (count = 0; count < MAX_SCAN_OUT; count++) {

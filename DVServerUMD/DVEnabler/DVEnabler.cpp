@@ -226,7 +226,7 @@ bool IterateDisplays(const disp_info& dinfo)
 	LONG result = SetDisplayConfig(
         (UINT32)state.paths.size(), state.paths.data(),
         (UINT32)state.modes.size(), state.modes.data(),
-        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+						 SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE | SDC_FORCE_MODE_ENUMERATION);
 
     if (result != ERROR_SUCCESS)
     {
