@@ -36,6 +36,14 @@ unsigned char * patch_edid_range_limits(unsigned char *edid)
             if (desc[10] == 0x01) {
                 desc[10] = 0x00;
             }
+			// Widen vertical (Hz) and horizontal (kHz) frequency ceilings
+			// to max (255) so Windows doesn't filter high resolution modes.
+			if (desc[6] < 255) {
+                desc[6] = 255;   // max vertical frequency (Hz)
+            }
+            if (desc[8] < 255) {
+                desc[8] = 255;   // max horizontal frequency (kHz)
+            }
             break;
         }
     }
