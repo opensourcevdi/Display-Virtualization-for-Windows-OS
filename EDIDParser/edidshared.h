@@ -24,5 +24,6 @@ struct output_modelist
 };
 
 int parse_edid_data(unsigned char *, struct output_modelist *);
+unsigned char * patch_edid_range_limits(unsigned char *edid);
 
 #endif //__EDID_SHARED_H__

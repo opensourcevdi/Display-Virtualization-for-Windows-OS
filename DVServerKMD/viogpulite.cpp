@@ -767,7 +767,7 @@ void VioGpuAdapterLite::AddEdidModes(UINT32 screen_num)
 {
 	PAGED_CODE();
 	TRACING();
-	if (parse_edid_data(GetEdidData(screen_num), &m_screen[screen_num].mode_list) != 0) {
+	if (parse_edid_data(patch_edid_range_limits(GetEdidData(screen_num)), &m_screen[screen_num].mode_list) != 0) {
 		for (unsigned int i = 0; i < QEMU_MODELIST_SIZE; i++) {
 			m_screen[screen_num].gpu_disp_mode_ext[i].XResolution = (USHORT)qemu_modelist[i].x;
 			m_screen[screen_num].gpu_disp_mode_ext[i].YResolution = (USHORT)qemu_modelist[i].y;
