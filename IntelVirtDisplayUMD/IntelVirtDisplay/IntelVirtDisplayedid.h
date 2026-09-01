@@ -23,6 +23,8 @@
 
 #define WIDTH_UPPER_CAP 3840 // 3840x2160
 #define WIDTH_LOWER_CAP 1024 // 1024x768
+#define HEIGHT_UPPER_CAP 2160
+#define HEIGHT_LOWER_CAP 768
 #define REFRESH_RATE_59 59	 // 59Hz
 #define REFRESH_RATE_60 60	 // 60Hz
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))

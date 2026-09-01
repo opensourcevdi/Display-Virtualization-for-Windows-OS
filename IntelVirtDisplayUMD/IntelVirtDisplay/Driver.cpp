@@ -1397,7 +1397,9 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
 	// ==============================
 
 	// Create a container ID
-	CoCreateGuid(&MonitorInfo.MonitorContainerId);
+	GUID cid = GetStableMonitorContainerId(ConnectorIndex);
+	DBGPRINT("ConnectorIndex=%u ContainerId=%!GUID!", ConnectorIndex, & cid);
+	MonitorInfo.MonitorContainerId = cid;
 
 	IDARG_IN_MONITORCREATE MonitorCreate = {};
 	MonitorCreate.ObjectAttributes = &Attr;
@@ -1718,6 +1720,7 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 	HANDLE hp_event = NULL;
 	HANDLE dve_event = NULL;
 	HANDLE hp_terminate_event = NULL;
+	HANDLE resize_event = NULL;
 	DWORD waitstatus;
 	bool do_set_event = FALSE;
 	bool d_edid = TRUE;
@@ -1802,12 +1805,45 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 		return INTELVIRTDISPLAYUMD_FAILURE;
 	}
 
+	// Create Security Descriptor for RESIZE_EVENT.
+	// Grants SYNCHRONIZE | EVENT_MODIFY_STATE to Local System (SY), Local Service (LS),
+	// and the interactive user (IU) only.
+	PSECURITY_DESCRIPTOR resize_psd = NULL;
+	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+			L"D:(A;;0x00100002;;;SY)(A;;0x00100002;;;LS)(A;;0x00100002;;;IU)", SDDL_REVISION_1, &resize_psd, NULL)) {
+		ERR("Failed to create security descriptor for RESIZE event, error: %d\n", GetLastError());
+		CloseHandle(dve_event);
+		CloseHandle(hp_event);
+		CloseHandle(hp_terminate_event);
+		return INTELVIRTDISPLAYUMD_FAILURE;
+	}
+
+	SECURITY_ATTRIBUTES resize_sa = {0};
+	resize_sa.nLength = sizeof(resize_sa);
+	resize_sa.lpSecurityDescriptor = resize_psd;
+	resize_sa.bInheritHandle = FALSE;
+
+	resize_event = CreateEvent(&resize_sa, FALSE, FALSE, RESIZE_EVENT);
+	if (NULL == resize_event && GetLastError() == ERROR_ACCESS_DENIED) {
+		resize_event = OpenEvent(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, RESIZE_EVENT);
+	}
+	DWORD resize_last_error = GetLastError();
+	LocalFree(resize_psd);
+	resize_psd = NULL;
+	if (NULL == resize_event) {
+		ERR("Cannot create RESIZE event! GetLastError: %d\n", resize_last_error);
+		CloseHandle(dve_event);
+		CloseHandle(hp_event);
+		CloseHandle(hp_terminate_event);
+		return INTELVIRTDISPLAYUMD_FAILURE;
+	}
+
 	// Create Security Descriptor for DISP_INFO shared memory section.
 	// Grants full section access to Local System (SY) and Local Service (LS),
 	// and read-only map access to the interactive user (IU).
 	PSECURITY_DESCRIPTOR shm_psd = NULL;
 	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-			L"D:(A;;0x000F001F;;;SY)(A;;0x000F001F;;;LS)(A;;0x00000004;;;IU)", SDDL_REVISION_1, &shm_psd, NULL)) {
+			L"D:(A;;0x000F001F;;;SY)(A;;0x000F001F;;;LS)(A;;0x000F001F;;;IU)", SDDL_REVISION_1, &shm_psd, NULL)) {
 		ERR("Failed to create security descriptor for shared memory, error: %d\n", GetLastError());
 		CloseHandle(dve_event);
 		CloseHandle(hp_event);
@@ -1858,7 +1894,7 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 	// and SYNCHRONIZE | MUTEX_MODIFY_STATE to the interactive user (IU).
 	PSECURITY_DESCRIPTOR mtx_psd = NULL;
 	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-			L"D:(A;;0x001F0001;;;SY)(A;;0x001F0001;;;LS)(A;;0x00100001;;;IU)", SDDL_REVISION_1, &mtx_psd, NULL)) {
+			L"D:(A;;0x001F0001;;;SY)(A;;0x001F0001;;;LS)(A;;0x001F0001;;;IU)", SDDL_REVISION_1, &mtx_psd, NULL)) {
 		ERR("Failed to create security descriptor for named mutex, error: %d\n", GetLastError());
 		CloseHandle(dve_event);
 		CloseHandle(hp_event);
@@ -1899,10 +1935,12 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 
 	pDeviceContextWrapper->pContext->FinishInit(PRIMARY_IDD_INDEX);
 
+
 	// Default IDD monitor will be enabled at this time. so setting disp_count to 1.
 	WaitForSingleObject(hDispMutex, INFINITE);
 	pSharedMem->disp_count = 1;
 	ReleaseMutex(hDispMutex);
+
 
 	// Doing this set event to avoid dead lock during UMD driver reset.
 	status = SetEvent(dve_event);
@@ -1954,6 +1992,7 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 						DBGPRINT("call finishinit for DISPLAY = %d\n", count);
 						pDeviceContextWrapper->pContext->FinishInit(count);
 						dinfo.disp_count++;
+						DBGPRINT("Set new res on connect for %d: %d x %d @ %dHz\n", count, pSharedMem->disp_target_res[count].cx, pSharedMem->disp_target_res[count].cy, pSharedMem->disp_target_res[count].refresh);
 					}
 					do_set_event = TRUE;
 				} else if (hdata.screen_present[count]) {
@@ -1971,11 +2010,50 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 						memcpy_s(minfo[count].pEdidBlock, minfo->szEdidBlock, g_monitors[count].pEdidBlock,
 								 minfo->szEdidBlock);
 
-						// Remove the display and connect it again with fresh EDID
-						IddCxMonitorDeparture(g_monitorobject_list[count]);
-						g_monitorobject_list[count] = NULL;
-						pDeviceContextWrapper->pContext->FinishInit(count);
-						do_set_event = TRUE;
+						UINT ModeCount = g_monitors[count].modes_count; 
+						if (ModeCount == 0)
+						{
+							DBGPRINT("No modes found for display = %d\n", count);
+							continue;
+						}
+						// Check if the monitor already has the resolution set, if yes then no need to update the modes again.
+						if (pSharedMem->disp_target_res[count].cx == g_monitors[count].pModeList[0].Width &&
+							pSharedMem->disp_target_res[count].cy == g_monitors[count].pModeList[0].Height &&
+							pSharedMem->disp_target_res[count].refresh == g_monitors[count].pModeList[0].VSync) {
+							continue;
+						}
+
+						IDDCX_TARGET_MODE* PTargetMode = (IDDCX_TARGET_MODE*)malloc(sizeof(IDDCX_TARGET_MODE) * (ModeCount));
+						if (PTargetMode == NULL)
+						{
+							DBGPRINT("Failed to allocate memory for target modes for display = %d\n", count);
+							continue;
+						}
+						for (UINT i = 0; i < ModeCount; ++i)
+						{
+							PTargetMode[i] = CreateIddCxTargetMode(
+								(int) g_monitors[count].pModeList[i].Width,
+								(int) g_monitors[count].pModeList[i].Height,
+								(int) g_monitors[count].pModeList[i].VSync);
+							DBGPRINT("Mode %d: %d x %d @ %dHz\n", i, g_monitors[count].pModeList[i].Width, g_monitors[count].pModeList[i].Height, g_monitors[count].pModeList[i].VSync);
+						}
+						WaitForSingleObject(hDispMutex, INFINITE);
+						pSharedMem->disp_target_res[count].cx = g_monitors[count].pModeList[0].Width;
+						pSharedMem->disp_target_res[count].cy = g_monitors[count].pModeList[0].Height;
+						pSharedMem->disp_target_res[count].refresh = g_monitors[count].pModeList[0].VSync;
+						pSharedMem->disp_target_res[count].set = true;
+						pSharedMem->disp_target_res[count].enabled = true;
+						ReleaseMutex(hDispMutex);
+						IDARG_IN_UPDATEMODES UpdateModes{ IDDCX_UPDATE_REASON_OTHER, ModeCount, PTargetMode };
+						NTSTATUS Status = IddCxMonitorUpdateModes(g_monitorobject_list[count], &UpdateModes);
+						if (!NT_SUCCESS(Status)) {
+							DBGPRINT("IddCxMonitorUpdateModes failed with: 0x%X\n", Status);
+						}
+						free(PTargetMode);						
+						status = SetEvent(resize_event);
+						if (status == NULL) {
+							ERR("Set resize-event failed with error [%d]\n ", GetLastError());
+						}
 					} else {
 						DBGPRINT("No changes in DISPLAY = %d\n", count);
 					}
@@ -1984,7 +2062,7 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 					DBGPRINT("No changes in DISPLAY = %d\n", count);
 				}
 			}
-
+			
 			if ((do_set_event)) {
 				DBGPRINT("disp_count = %d", dinfo.disp_count);
 				WaitForSingleObject(hDispMutex, INFINITE);

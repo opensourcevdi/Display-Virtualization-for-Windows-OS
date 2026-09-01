@@ -28,6 +28,95 @@ static inline int add_mode(struct output_modelist *l, unsigned w, unsigned h, do
  *
  * Description
  *
+ * patch_edid_range_limits - Patch the Range Limits (0xFD) descriptor in a 128-byte
+ * base EDID block so Windows treats it as GTF-capable and stops filtering 
+ * custom modes.
+ *
+ *
+ * Parameters
+ * unsigned char *edid_data - input edid 256 bytes array
+ *
+ ******************************************************************************/
+void patch_edid_range_limits(unsigned char *edid)
+{
+	// --- Clamp the Preferred Timing Mode (DTD #1, offset 54) if present ---
+    // A DTD is identified by a non-zero pixel clock in bytes 0-1; monitor
+    // descriptors always have 0x0000 there (that's what the loop below
+    // checks for), so this doesn't collide with that logic.
+    unsigned char *dtd = edid + 54;
+    unsigned int pixelClock10kHz = dtd[0] | (dtd[1] << 8);
+
+    if (pixelClock10kHz != 0) {
+        unsigned int hActive = dtd[2] | ((dtd[4] >> 4) << 8);
+        unsigned int hBlank  = dtd[3] | ((dtd[4] & 0x0F) << 8);
+        unsigned int vActive = dtd[5] | ((dtd[7] >> 4) << 8);
+        unsigned int vBlank  = dtd[6] | ((dtd[7] & 0x0F) << 8);
+
+        unsigned int clampedH = max(1024, min(hActive, 3840));
+        unsigned int clampedV = max(768, min(vActive, 2160));
+
+        if (clampedH != hActive || clampedV != vActive) {
+            // Recompute pixel clock so the declared refresh rate stays sane
+            // for the new active size, keeping the original blanking widths.
+            unsigned int hTotalOrig = hActive + hBlank;
+            unsigned int vTotalOrig = vActive + vBlank;
+            double refreshHz = (hTotalOrig && vTotalOrig)
+                ? (pixelClock10kHz * 10000.0) / ((double)hTotalOrig * (double)vTotalOrig)
+                : 60.0;
+
+            unsigned int hTotalNew = clampedH + hBlank;
+            unsigned int vTotalNew = clampedV + vBlank;
+            unsigned int pixelClockNew =
+                (unsigned int)((refreshHz * hTotalNew * vTotalNew) / 10000.0 + 0.5);
+
+            dtd[0] = (unsigned char)(pixelClockNew & 0xFF);
+            dtd[1] = (unsigned char)((pixelClockNew >> 8) & 0xFF);
+            dtd[2] = (unsigned char)(clampedH & 0xFF);
+            dtd[4] = (unsigned char)(((clampedH >> 8) << 4) | (hBlank >> 8));
+            dtd[5] = (unsigned char)(clampedV & 0xFF);
+            dtd[7] = (unsigned char)(((clampedV >> 8) << 4) | (vBlank >> 8));
+        }
+    }
+
+    for (int off = 54; off <= 108; off += 18) {
+        unsigned char  *desc = edid + off;
+
+        // Monitor descriptor marker: bytes 0-2 must be zero, tag in byte 3
+        if (desc[0] == 0x00 && desc[1] == 0x00 && desc[2] == 0x00 &&
+            desc[3] == 0xFD) {
+            // Timing Formula Support flag (byte 10 of the descriptor)
+            // 0x01 = range only, no GTF/CVT  ->  0x00 = default GTF supported
+            if (desc[10] == 0x01) {
+                desc[10] = 0x00;
+			}
+			// Widen vertical (Hz) and horizontal (kHz) frequency ceilings
+			// to max (255) so Windows doesn't filter high resolution modes.
+			if (desc[6] < 255) {
+                desc[6] = 255;   // max vertical frequency (Hz)
+            }
+            if (desc[8] < 255) {
+                desc[8] = 255;   // max horizontal frequency (kHz)
+            }
+			if (desc[9] < 255) {
+				desc[9] = 255;   // max pixel clock (255 × 10 MHz = 2550 MHz)
+			}
+            break;
+        }
+    }
+
+    // Recompute base-block checksum
+    unsigned int sum = 0;
+    for (int i = 0; i < 127; i++) {
+        sum += edid[i];
+    }
+    edid[127] = (unsigned char )(0x100 - (sum & 0xff));
+
+}
+
+/*******************************************************************************
+ *
+ * Description
+ *
  * parse_edid_data - First checks the validity of the hex_input. If valid, then
  * parses all the resolution modelist from it.
  *

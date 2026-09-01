@@ -22,6 +22,7 @@
 #define HOTPLUG_TERMINATE_EVENT L"Global\\HOTPLUG_TERMINATE_EVENT"
 #define DISP_INFO L"Global\\DISP_INFO"
 #define DISP_INFO_MUTEX L"Global\\DISP_INFO_MUTEX"
+#define RESIZE_EVENT L"Global\\IntelVirtDisplayResizeEvent"
 #define PRIMARY_IDD_INDEX 0
 
 // MTL Device ID Lists

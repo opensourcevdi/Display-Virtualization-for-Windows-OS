@@ -10,6 +10,7 @@
 // add headers that you want to pre-compile here
 #include "framework.h"
 #include <vector>
+#include "..\Shared\Shared.h"
 
 /* INTELVIRTDISPLAYENABLER Error Codes */
 #define INTELVIRTDISPLAYENABLER_SUCCESS 0
@@ -19,12 +20,17 @@
 #define DVE_EVENT L"Global\\DVE_EVENT"
 #define DISP_INFO L"Global\\DISP_INFO"
 #define DISP_INFO_MUTEX L"Global\\DISP_INFO_MUTEX"
+#define RESIZE_EVENT L"Global\\IntelVirtDisplayResizeEvent"
 #define DELAY_TIME 50
 int intelvirtdisplayenabler_init();
-struct disp_info
-{
-	int disp_count;
-};
+static bool HandleHPEvent(HANDLE hp_event);
+static void HandleResizeEvent();
+static void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, DWORD Width, DWORD Height, DWORD VSync);
 int GetDisplayCount(disp_info *pdinfo);
 int IsSystemLocked();
+struct DisplayConfigState
+{
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+};
 #endif // PCH_H

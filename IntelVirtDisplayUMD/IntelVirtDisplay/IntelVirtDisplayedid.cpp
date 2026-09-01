@@ -98,7 +98,7 @@ int get_edid_data(HANDLE devHandle, void *m, DWORD id, BOOL d_edid)
 		free(edata);
 		return INTELVIRTDISPLAYUMD_FAILURE;
 	}
-	if (edata->mode_size > MODE_LIST_MAX_SIZE) {
+	if (edata->mode_size > MODE_LIST_MAX_SIZE  || edata->mode_size == 0) {
 		ERR("Invalid id \n");
 		free(edata);
 		return INTELVIRTDISPLAYUMD_FAILURE;
@@ -124,6 +124,7 @@ int get_edid_data(HANDLE devHandle, void *m, DWORD id, BOOL d_edid)
 			edid_mode_index++;
 		}
 	}
+	monitor->modes_count = edid_mode_index;
 
 	free(edata);
 	return INTELVIRTDISPLAYUMD_SUCCESS;
