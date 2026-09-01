@@ -24,6 +24,7 @@
 #include "Trace.h"
 #include "IntelVirtDisplayedid.h"
 #include "..\..\IntelVirtDisplayKMD\Public.h"
+#include "..\Shared\Shared.h"
 
 DEFINE_GUID(GUID_DEVINTERFACE_INTELVIRTDISPLAYKMD, 0x1c514918, 0xa855, 0x460a, 0x97, 0xda, 0xed, 0x69, 0x1d, 0xd5, 0x63, 0xcf);
 
@@ -63,6 +64,7 @@ struct IndirectSampleMonitor
 		DWORD VSync;
 	} pModeList[szModeList];
 	DWORD ulPreferredModeIdx;
+	UINT modes_count;
 };
 
 /// <summary>
@@ -186,10 +188,10 @@ public:
 	void UnassignSwapChain();
 
 	void SetupIntelVirtDisplayCursor();
+	UINT m_MonitorIndex;
 
 private:
 	IDDCX_MONITOR m_Monitor;
-	UINT m_MonitorIndex;
 	std::unique_ptr<SwapChainProcessor> m_ProcessingThread;
 	HANDLE m_cursor_event;
 };
@@ -199,10 +201,6 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject);
 int get_hpd_data(HANDLE devHandle, struct hp_info *data);
 bool IsWindows11OrLater();
 DWORD GetGpuDeviceId();
-struct disp_info
-{
-	int disp_count;
-};
 
 struct monitor_info
 {
