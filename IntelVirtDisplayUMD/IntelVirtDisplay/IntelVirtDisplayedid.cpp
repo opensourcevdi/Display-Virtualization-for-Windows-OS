@@ -98,7 +98,7 @@ int get_edid_data(HANDLE devHandle, void *m, DWORD id, BOOL d_edid)
 		free(edata);
 		return INTELVIRTDISPLAYUMD_FAILURE;
 	}
-	if (edata->mode_size > MODE_LIST_MAX_SIZE) {
+	if (edata->mode_size > MODE_LIST_MAX_SIZE  || edata->mode_size == 0) {
 		ERR("Invalid id \n");
 		free(edata);
 		return INTELVIRTDISPLAYUMD_FAILURE;
@@ -107,9 +107,12 @@ int get_edid_data(HANDLE devHandle, void *m, DWORD id, BOOL d_edid)
 	memcpy_s(monitor->pEdidBlock, monitor->szEdidBlock, edata->edid_data, monitor->szEdidBlock);
 	monitor->ulPreferredModeIdx = 0;
 
+	// clamp preferred resolution to be within the defined limits
+	edata->mode_list[0].width = max(WIDTH_LOWER_CAP,  min(edata->mode_list[0].width,  WIDTH_UPPER_CAP));
+	edata->mode_list[0].height = max(HEIGHT_LOWER_CAP,  min(edata->mode_list[0].height,  HEIGHT_UPPER_CAP));
 	DBGPRINT("Modes\n");
 	for (i = 0; i < edata->mode_size; i++) {
-		// TRIMMING LOGIC: Restricting EDID size to 32 and discarding modes with width more than 3840 & less than 1024
+		// TRIMMING LOGIC: Restricting EDID size to 32 and discarding modes with width more than 3840 & less than 640
 		if ((edata->mode_list[i].width <= WIDTH_UPPER_CAP) && (edata->mode_list[i].width >= WIDTH_LOWER_CAP) &&
 			(edid_mode_index < monitor->szModeList) &&
 			(is_blacklist(edata->mode_list[i].width, edata->mode_list[i].height) == 0)) {
@@ -124,6 +127,7 @@ int get_edid_data(HANDLE devHandle, void *m, DWORD id, BOOL d_edid)
 			edid_mode_index++;
 		}
 	}
+	monitor->modes_count = edid_mode_index;
 
 	free(edata);
 	return INTELVIRTDISPLAYUMD_SUCCESS;

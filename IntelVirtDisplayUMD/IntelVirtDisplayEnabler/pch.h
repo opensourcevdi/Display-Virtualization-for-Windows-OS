@@ -21,10 +21,28 @@
 #define DISP_INFO_MUTEX L"Global\\DISP_INFO_MUTEX"
 #define DELAY_TIME 50
 int intelvirtdisplayenabler_init();
+static void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, DWORD Width, DWORD Height, DWORD VSync);
+GUID GetStableMonitorContainerId(UINT ConnectorIndex);
+struct disp_target_res
+{
+	UINT32 cx;
+	UINT32 cy;
+	DWORD refresh;
+	uint8_t enabled;
+	uint8_t set;
+};
 struct disp_info
 {
 	int disp_count;
+	disp_target_res disp_target_res[4];
 };
+
+struct DisplayConfigState
+{
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+};
+
 int GetDisplayCount(disp_info *pdinfo);
 int IsSystemLocked();
 #endif // PCH_H

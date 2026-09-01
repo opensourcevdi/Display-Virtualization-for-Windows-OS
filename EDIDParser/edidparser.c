@@ -28,6 +28,53 @@ static inline int add_mode(struct output_modelist *l, unsigned w, unsigned h, do
  *
  * Description
  *
+ * patch_edid_range_limits - Patch the Range Limits (0xFD) descriptor in a 128-byte
+ * base EDID block so Windows treats it as GTF-capable and stops filtering 
+ * custom modes.
+ *
+ *
+ * Parameters
+ * unsigned char *edid_data - input edid 256 bytes array
+ *
+ ******************************************************************************/
+unsigned char * patch_edid_range_limits(unsigned char *edid)
+{
+    for (int off = 54; off <= 108; off += 18) {
+        unsigned char  *desc = edid + off;
+
+        // Monitor descriptor marker: bytes 0-2 must be zero, tag in byte 3
+        if (desc[0] == 0x00 && desc[1] == 0x00 && desc[2] == 0x00 &&
+            desc[3] == 0xFD) {
+            // Timing Formula Support flag (byte 10 of the descriptor)
+            // 0x01 = range only, no GTF/CVT  ->  0x00 = default GTF supported
+            if (desc[10] == 0x01) {
+                desc[10] = 0x00;
+			}
+			// Widen vertical (Hz) and horizontal (kHz) frequency ceilings
+			// to max (255) so Windows doesn't filter high resolution modes.
+			if (desc[6] < 255) {
+                desc[6] = 255;   // max vertical frequency (Hz)
+            }
+            if (desc[8] < 255) {
+                desc[8] = 255;   // max horizontal frequency (kHz)
+            }
+            break;
+        }
+    }
+
+    // Recompute base-block checksum
+    unsigned int sum = 0;
+    for (int i = 0; i < 127; i++) {
+        sum += edid[i];
+    }
+    edid[127] = (unsigned char )(0x100 - (sum & 0xff));
+	return edid;
+}
+
+/*******************************************************************************
+ *
+ * Description
+ *
  * parse_edid_data - First checks the validity of the hex_input. If valid, then
  * parses all the resolution modelist from it.
  *

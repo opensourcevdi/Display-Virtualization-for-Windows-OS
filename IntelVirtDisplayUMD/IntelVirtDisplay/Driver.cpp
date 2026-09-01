@@ -117,6 +117,16 @@ static IDDCX_TARGET_MODE CreateIddCxTargetMode(DWORD Width, DWORD Height, DWORD 
 	return Mode;
 }
 
+GUID GetStableMonitorContainerId(UINT ConnectorIndex)
+{
+    static const GUID Namespace =
+    { 0x7d51b9b0, 0x5eb5, 0x40ab, { 0xa5, 0x99, 0xff, 0x1c, 0x89, 0x77, 0x28, 0xb0 } };
+
+    GUID Id = Namespace;
+    Id.Data1 ^= ConnectorIndex;   // fold in the connector index deterministically
+    return Id;
+}
+
 #pragma endregion
 
 extern "C" DRIVER_INITIALIZE DriverEntry;
@@ -1297,7 +1307,9 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
 	// ==============================
 
 	// Create a container ID
-	CoCreateGuid(&MonitorInfo.MonitorContainerId);
+	GUID cid = GetStableMonitorContainerId(ConnectorIndex);
+	DBGPRINT("ConnectorIndex=%u ContainerId=%!GUID!", ConnectorIndex, & cid);
+	MonitorInfo.MonitorContainerId = cid;
 
 	IDARG_IN_MONITORCREATE MonitorCreate = {};
 	MonitorCreate.ObjectAttributes = &Attr;
@@ -1829,6 +1841,7 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 				continue;
 			}
 
+			WaitForSingleObject(hDispMutex, INFINITE);
 			// call display arrival and departure based on previous and current display state.
 			for (count = 0; count < MAX_SCAN_OUT; count++) {
 
@@ -1840,6 +1853,8 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 						IddCxMonitorDeparture(g_monitorobject_list[count]);
 						g_monitorobject_list[count] = NULL;
 						memset(minfo[count].pEdidBlock, 0, minfo[count].szEdidBlock);
+						pSharedMem->disp_target_res[count].set = true;
+						pSharedMem->disp_target_res[count].enabled = false;
 						dinfo.disp_count--;
 					} else {
 						if (get_edid_data(g_DevInfo->get_Handle(), &g_monitors[count], count, d_edid) ==
@@ -1854,6 +1869,12 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 						DBGPRINT("call finishinit for DISPLAY = %d\n", count);
 						pDeviceContextWrapper->pContext->FinishInit(count);
 						dinfo.disp_count++;
+						pSharedMem->disp_target_res[count].cx = g_monitors[count].pModeList[0].Width;
+						pSharedMem->disp_target_res[count].cy = g_monitors[count].pModeList[0].Height;
+						pSharedMem->disp_target_res[count].refresh = g_monitors[count].pModeList[0].VSync;
+						pSharedMem->disp_target_res[count].set = true;
+						pSharedMem->disp_target_res[count].enabled = true;
+						DBGPRINT("Set new res on connect for %d: %d x %d @ %dHz\n", count, pSharedMem->disp_target_res[count].cx, pSharedMem->disp_target_res[count].cy, pSharedMem->disp_target_res[count].refresh);
 					}
 					do_set_event = TRUE;
 				} else if (hdata.screen_present[count]) {
@@ -1871,11 +1892,27 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 						memcpy_s(minfo[count].pEdidBlock, minfo->szEdidBlock, g_monitors[count].pEdidBlock,
 								 minfo->szEdidBlock);
 
-						// Remove the display and connect it again with fresh EDID
-						IddCxMonitorDeparture(g_monitorobject_list[count]);
-						g_monitorobject_list[count] = NULL;
-						pDeviceContextWrapper->pContext->FinishInit(count);
-						do_set_event = TRUE;
+						UINT ModeCount = g_monitors[count].modes_count; 
+						IDDCX_TARGET_MODE* PTargetMode = (IDDCX_TARGET_MODE*)malloc(sizeof(IDDCX_TARGET_MODE) * (ModeCount));
+						for (UINT i = 0; i < ModeCount; ++i)
+						{
+							PTargetMode[i] = CreateIddCxTargetMode(
+								(int) g_monitors[count].pModeList[i].Width,
+								(int) g_monitors[count].pModeList[i].Height,
+								(int) g_monitors[count].pModeList[i].VSync);
+							DBGPRINT("Mode %d: %d x %d @ %dHz\n", i, g_monitors[count].pModeList[i].Width, g_monitors[count].pModeList[i].Height, g_monitors[count].pModeList[i].VSync);
+						}
+						pSharedMem->disp_target_res[count].cx = g_monitors[count].pModeList[0].Width;
+						pSharedMem->disp_target_res[count].cy = g_monitors[count].pModeList[0].Height;
+						pSharedMem->disp_target_res[count].refresh = g_monitors[count].pModeList[0].VSync;
+						pSharedMem->disp_target_res[count].set = true;
+						pSharedMem->disp_target_res[count].enabled = true;
+						IDARG_IN_UPDATEMODES UpdateModes{ IDDCX_UPDATE_REASON_OTHER, ModeCount, PTargetMode };
+						NTSTATUS Status = IddCxMonitorUpdateModes(g_monitorobject_list[count], &UpdateModes);
+						if (!NT_SUCCESS(Status)) {
+							DBGPRINT("IddCxMonitorUpdateModes failed with: 0x%X\n", Status);
+						}
+						free(PTargetMode);						do_set_event = TRUE;
 					} else {
 						DBGPRINT("No changes in DISPLAY = %d\n", count);
 					}
@@ -1884,12 +1921,10 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 					DBGPRINT("No changes in DISPLAY = %d\n", count);
 				}
 			}
-
+			pSharedMem->disp_count = dinfo.disp_count;
+			ReleaseMutex(hDispMutex);
 			if ((do_set_event)) {
 				DBGPRINT("disp_count = %d", dinfo.disp_count);
-				WaitForSingleObject(hDispMutex, INFINITE);
-				pSharedMem->disp_count = dinfo.disp_count;
-				ReleaseMutex(hDispMutex);
 				status = SetEvent(dve_event);
 				if (status == NULL) {
 					ERR("Set dve-event failed during Display Arrival/departure with error [%d]\n ", GetLastError());
