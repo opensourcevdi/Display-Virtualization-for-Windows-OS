@@ -22,8 +22,17 @@
 #include <Devpkey.h>
 #include "Trace_override.h"
 
-int intelvirtdisplayenabler_init()
-{
+extern "C" __declspec(dllexport) int CALLBACK intelvirtdisplayenabler_init(
+    HWND hwnd,        // Handle to owner window
+    HINSTANCE hinst,  // Instance handle of the DLL
+    LPSTR lpszCmdLine,// Command line string
+    int nCmdShow      // Window show state
+){
+	UNREFERENCED_PARAMETER(hwnd);
+	UNREFERENCED_PARAMETER(hinst);
+	UNREFERENCED_PARAMETER(lpszCmdLine);
+	UNREFERENCED_PARAMETER(nCmdShow);
+	
 	WPP_INIT_TRACING(NULL);
 	TRACING();
 	DBGPRINT("IntelVirtDisplayEnabler init dve_event\n");
