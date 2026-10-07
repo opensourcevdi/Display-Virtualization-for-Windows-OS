@@ -47,6 +47,17 @@ HANDLE g_hpdthread_handle = NULL;
 
 IDDCX_MONITOR g_monitorobject_list[MAX_SCAN_OUT] = {0};
 
+// Display target identity per connector, captured from IddCxMonitorArrival and
+// invalidated on departure. Published to the enabler so it can match a resize
+// request onto the owning display path.
+struct monitor_identity
+{
+	LUID adapter_id;
+	UINT32 target_id;
+	BOOL valid;
+};
+static struct monitor_identity g_monitor_identity[MAX_SCAN_OUT] = {};
+
 BOOL hwcursorsupported = TRUE;
 
 #pragma region SampleMonitors
@@ -70,6 +81,8 @@ Microsoft::WRL::Wrappers::Event g_intelvirtdisplay_cursor_os_event[MAX_SCAN_OUT]
 #define CURSOR_MAX_HEIGHT 128
 #define INITIAL_CURSOR_SHAPE_ID 0
 #define INTELVIRTDISPLAY_CURSOREVENT_WAIT_TIMEOUT 16 // 16ms wait timeout for the IDD cursor event
+#define EDID_IDENTITY_OFFSET 8 // EDID manufacturer/product/serial identity fields start here
+#define EDID_IDENTITY_SIZE 10  // Size of the EDID identity fields used to detect a monitor change
 
 #pragma endregion
 
@@ -115,6 +128,50 @@ static IDDCX_TARGET_MODE CreateIddCxTargetMode(DWORD Width, DWORD Height, DWORD 
 	FillSignalInfo(Mode.TargetVideoSignalInfo.targetVideoSignalInfo, Width, Height, VSync, false);
 
 	return Mode;
+}
+
+/*******************************************************************************
+ *
+ * Description
+ *
+ * update_monitor_modes - Refreshes the target mode list on an already connected
+ * monitor. This is used for resize, where the mode list changes but the monitor
+ * itself is unchanged, so the new resolution appears in display settings without
+ * a monitor departure/arrival cycle.
+ *
+ * Parameters
+ * MonitorObject - IDDCX monitor object that is currently connected
+ * monitor - pointer to the IndirectSampleMonitor holding the new mode list
+ *
+ * Return val
+ * int - 0 == SUCCESS, -1 = ERROR
+ *
+ ******************************************************************************/
+static int update_monitor_modes(IDDCX_MONITOR MonitorObject, const IndirectSampleMonitor *monitor)
+{
+	if ((MonitorObject == NULL) || (monitor == NULL) || (monitor->modes_count == 0)) {
+		return INTELVIRTDISPLAYUMD_FAILURE;
+	}
+
+	vector<IDDCX_TARGET_MODE> TargetModes;
+	for (DWORD ModeIndex = 0; ModeIndex < monitor->modes_count; ModeIndex++) {
+		TargetModes.push_back(CreateIddCxTargetMode(monitor->pModeList[ModeIndex].Width,
+													monitor->pModeList[ModeIndex].Height,
+													monitor->pModeList[ModeIndex].VSync));
+	}
+
+	IDARG_IN_UPDATEMODES UpdateModes = {};
+	UpdateModes.Reason = IDDCX_UPDATE_REASON_OTHER;
+	UpdateModes.TargetModeCount = (UINT)TargetModes.size();
+	UpdateModes.pTargetModes = TargetModes.data();
+
+	NTSTATUS Status = IddCxMonitorUpdateModes(MonitorObject, &UpdateModes);
+	if (!NT_SUCCESS(Status)) {
+		ERR("IddCxMonitorUpdateModes failed with error 0x%X\n", Status);
+		return INTELVIRTDISPLAYUMD_FAILURE;
+	}
+
+	return INTELVIRTDISPLAYUMD_SUCCESS;
 }
 
 #pragma endregion
@@ -1416,6 +1473,17 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
 		Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
 		if (!(NT_SUCCESS(Status))) {
 			ERR(" Monitor Arrival failed with  error 0x%X\n", Status);
+			g_monitor_identity[ConnectorIndex].valid = FALSE;
+		} else {
+			// Arrival is the only place the OS hands out the display target identity for
+			// this connector. Cache it so a resize request can be matched onto the exact
+			// display path instead of relying on the path enumeration order.
+			g_monitor_identity[ConnectorIndex].adapter_id = ArrivalOut.OsAdapterLuid;
+			g_monitor_identity[ConnectorIndex].target_id = ArrivalOut.OsTargetId;
+			g_monitor_identity[ConnectorIndex].valid = TRUE;
+			DBGPRINT("DISPLAY = %d identity adapter=%08X:%08X target=%d\n", ConnectorIndex,
+					 (UINT)ArrivalOut.OsAdapterLuid.HighPart, (UINT)ArrivalOut.OsAdapterLuid.LowPart,
+					 ArrivalOut.OsTargetId);
 		}
 		g_monitorobject_list[ConnectorIndex] = MonitorCreateOut.MonitorObject;
 	} else {
@@ -1566,49 +1634,90 @@ _Use_decl_annotations_ NTSTATUS IntelVirtDisplayUMDAdapterCommitModes(IDDCX_ADAP
 	return STATUS_SUCCESS;
 }
 
-_Use_decl_annotations_ NTSTATUS IntelVirtDisplayUMDParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION *pInArgs,
-																   IDARG_OUT_PARSEMONITORDESCRIPTION *pOutArgs)
+/*******************************************************************************
+ *
+ * Description
+ *
+ * find_monitor_for_description - Maps a monitor description supplied by the OS
+ * back onto the g_monitors[] entry that owns it.
+ *
+ * A resize rewrites the EDID detailed timing descriptor, but IddCx has no way to
+ * replace the description it captured at IddCxMonitorCreate. The OS therefore
+ * keeps handing back the original EDID while g_monitors[] already holds the new
+ * one, so an exact comparison stops matching after the first resize. Falling
+ * back to the EDID identity bytes keeps the right monitor resolved, they are the
+ * manufacturer id, product code, serial number and manufacture date and are
+ * stable across a resize.
+ *
+ * Parameters
+ * pDescription - EDID block supplied by the OS
+ * DataSize - size of the supplied EDID block
+ *
+ * Return val
+ * int - index into g_monitors[], or -1 when nothing matched
+ *
+ ******************************************************************************/
+// Offset and length of the EDID identity fields, bytes 8..17 hold the
+// manufacturer id, product code, serial number and week/year of manufacture.
+#define EDID_IDENTITY_OFFSET 8
+#define EDID_IDENTITY_SIZE 10
+
+static int find_monitor_for_description(const BYTE *pDescription, size_t DataSize)
 {
-	// ==============================
-	// TODO: In a real driver, this function would be called to generate monitor modes for an EDID by parsing it. In
-	// this sample driver, we hard-code the EDID, so this function can generate known modes.
-	// ==============================
+	if ((pDescription == NULL) || (DataSize != IndirectSampleMonitor::szEdidBlock) || (g_monitors == NULL)) {
+		return -1;
+	}
+
+	for (DWORD idx = 0; idx < intelvirtdisplay_monitor_count; idx++) {
+		if (memcmp(pDescription, g_monitors[idx].pEdidBlock, IndirectSampleMonitor::szEdidBlock) == 0) {
+			return (int)idx;
+		}
+	}
+
+	// No exact match, so the description is a pre-resize snapshot. Resolve it by
+	// monitor identity instead and report the current mode list for that monitor.
+	for (DWORD idx = 0; idx < intelvirtdisplay_monitor_count; idx++) {
+		if (memcmp(pDescription + EDID_IDENTITY_OFFSET, g_monitors[idx].pEdidBlock + EDID_IDENTITY_OFFSET,
+				   EDID_IDENTITY_SIZE) == 0) {
+			DBGPRINT("Description is stale for monitor %d, matched on EDID identity\n", idx);
+			return (int)idx;
+		}
+	}
+
+	return -1;
+}
+
+_Use_decl_annotations_ NTSTATUS IntelVirtDisplayUMDParseMonitorDescription(
+	const IDARG_IN_PARSEMONITORDESCRIPTION *pInArgs, IDARG_OUT_PARSEMONITORDESCRIPTION *pOutArgs)
+{
 	TRACING();
 
-	pOutArgs->MonitorModeBufferOutputCount = IndirectSampleMonitor::szModeList;
+	if (pInArgs->MonitorDescription.DataSize != IndirectSampleMonitor::szEdidBlock)
+		return STATUS_INVALID_PARAMETER;
 
-	if (pInArgs->MonitorModeBufferInputCount < IndirectSampleMonitor::szModeList) {
-		// Return success if there was no buffer, since the caller was only asking for a count of modes
-		return (pInArgs->MonitorModeBufferInputCount > 0) ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
-	} else {
-		// In the sample driver, we have reported some static information about connected monitors
-		// Check which of the reported monitors this call is for by comparing it to the pointer of
-		// our known EDID blocks.
-
-		if (pInArgs->MonitorDescription.DataSize != IndirectSampleMonitor::szEdidBlock)
-			return STATUS_INVALID_PARAMETER;
-
-		for (DWORD SampleMonitorIdx = 0; SampleMonitorIdx < intelvirtdisplay_monitor_count; SampleMonitorIdx++) {
-			if (memcmp(pInArgs->MonitorDescription.pData, g_monitors[SampleMonitorIdx].pEdidBlock,
-					   IndirectSampleMonitor::szEdidBlock) == 0) {
-				// Copy the known modes to the output buffer
-				for (DWORD ModeIndex = 0; ModeIndex < IndirectSampleMonitor::szModeList; ModeIndex++) {
-					pInArgs->pMonitorModes[ModeIndex] =
-						CreateIddCxMonitorMode(g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Width,
-											   g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Height,
-											   g_monitors[SampleMonitorIdx].pModeList[ModeIndex].VSync,
-											   IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR);
-				}
-
-				// Set the preferred mode as represented in the EDID
-				pOutArgs->PreferredMonitorModeIdx = g_monitors[SampleMonitorIdx].ulPreferredModeIdx;
-				return STATUS_SUCCESS;
-			}
-		}
-
-		// This EDID block does not belong to the monitors we reported earlier
+	int SampleMonitorIdx =
+		find_monitor_for_description((const BYTE *)pInArgs->MonitorDescription.pData,
+									 pInArgs->MonitorDescription.DataSize);
+	if (SampleMonitorIdx < 0) {
 		return STATUS_INVALID_PARAMETER;
 	}
+
+	const DWORD mode_count = g_monitors[SampleMonitorIdx].modes_count;
+	pOutArgs->MonitorModeBufferOutputCount = mode_count;
+
+	if (pInArgs->MonitorModeBufferInputCount < mode_count) {
+		return (pInArgs->MonitorModeBufferInputCount > 0) ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
+	}
+
+	for (DWORD ModeIndex = 0; ModeIndex < mode_count; ModeIndex++) {
+		pInArgs->pMonitorModes[ModeIndex] = CreateIddCxMonitorMode(
+			g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Width,
+			g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Height,
+			g_monitors[SampleMonitorIdx].pModeList[ModeIndex].VSync, IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR);
+	}
+
+	pOutArgs->PreferredMonitorModeIdx = g_monitors[SampleMonitorIdx].ulPreferredModeIdx;
+	return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_ NTSTATUS IntelVirtDisplayUMDMonitorGetDefaultModes(IDDCX_MONITOR MonitorObject,
@@ -1645,7 +1754,6 @@ _Use_decl_annotations_ NTSTATUS IntelVirtDisplayUMDMonitorQueryModes(IDDCX_MONIT
 															 const IDARG_IN_QUERYTARGETMODES *pInArgs,
 															 IDARG_OUT_QUERYTARGETMODES *pOutArgs)
 {
-	UNREFERENCED_PARAMETER(MonitorObject);
 	TRACING();
 
 	vector<IDDCX_TARGET_MODE> TargetModes;
@@ -1654,29 +1762,43 @@ _Use_decl_annotations_ NTSTATUS IntelVirtDisplayUMDMonitorQueryModes(IDDCX_MONIT
 	// monitor's descriptor and instead are based on the static processing capability of the device. The OS will
 	// report the available set of modes for a given output as the intersection of monitor modes with target modes.
 
-	DWORD SampleMonitorIdx = 0;
-	for (SampleMonitorIdx = 0; SampleMonitorIdx < intelvirtdisplay_monitor_count; SampleMonitorIdx++) {
-		if (memcmp(pInArgs->MonitorDescription.pData, g_monitors[SampleMonitorIdx].pEdidBlock,
-				   IndirectSampleMonitor::szEdidBlock) == 0) {
-			// Copy the known modes to the output buffer
-			for (DWORD ModeIndex = 0; ModeIndex < IndirectSampleMonitor::szModeList; ModeIndex++) {
-				if (SampleMonitorIdx < intelvirtdisplay_monitor_count) {
-					TargetModes.push_back(
-						CreateIddCxTargetMode(g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Width,
-											  g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Height,
-											  g_monitors[SampleMonitorIdx].pModeList[ModeIndex].VSync));
-				}
+	int SampleMonitorIdx =
+		find_monitor_for_description((const BYTE *)pInArgs->MonitorDescription.pData,
+									 pInArgs->MonitorDescription.DataSize);
+
+	// The description did not resolve, so fall back to the connector this monitor
+	// object was created for. That is an exact mapping and keeps the current mode
+	// list reported instead of failing the query.
+	if (SampleMonitorIdx < 0) {
+		auto *pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject);
+		for (DWORD idx = 0; idx < intelvirtdisplay_monitor_count; idx++) {
+			if ((pMonitorContextWrapper != NULL) && (pMonitorContextWrapper->pContext != NULL) &&
+				(g_monitorobject_list[idx] == MonitorObject)) {
+				SampleMonitorIdx = (int)idx;
+				DBGPRINT("QueryModes: description unresolved, using connector %d\n", idx);
+				break;
 			}
-			pOutArgs->TargetModeBufferOutputCount = (UINT)TargetModes.size();
-			if (pInArgs->TargetModeBufferInputCount >= TargetModes.size()) {
-				copy(TargetModes.begin(), TargetModes.end(), pInArgs->pTargetModes);
-			}
-			return STATUS_SUCCESS;
 		}
 	}
 
-	// This EDID block does not belong to the monitors we reported earlier
-	return STATUS_INVALID_PARAMETER;
+	if (SampleMonitorIdx < 0) {
+		// This EDID block does not belong to the monitors we reported earlier
+		return STATUS_INVALID_PARAMETER;
+	}
+
+	// Copy the known modes to the output buffer
+	for (DWORD ModeIndex = 0; ModeIndex < g_monitors[SampleMonitorIdx].modes_count; ModeIndex++) {
+		TargetModes.push_back(CreateIddCxTargetMode(g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Width,
+													g_monitors[SampleMonitorIdx].pModeList[ModeIndex].Height,
+													g_monitors[SampleMonitorIdx].pModeList[ModeIndex].VSync));
+	}
+
+	pOutArgs->TargetModeBufferOutputCount = (UINT)TargetModes.size();
+	if (pInArgs->TargetModeBufferInputCount >= TargetModes.size()) {
+		copy(TargetModes.begin(), TargetModes.end(), pInArgs->pTargetModes);
+	}
+
+	return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_ NTSTATUS IntelVirtDisplayUMDMonitorAssignSwapChain(IDDCX_MONITOR MonitorObject,
@@ -1804,10 +1926,11 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 
 	// Create Security Descriptor for DISP_INFO shared memory section.
 	// Grants full section access to Local System (SY) and Local Service (LS),
-	// and read-only map access to the interactive user (IU).
+	// and read/write map access to the interactive user (IU), the enabler has to
+	// clear the pending flag once a published resize has been applied.
 	PSECURITY_DESCRIPTOR shm_psd = NULL;
 	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-			L"D:(A;;0x000F001F;;;SY)(A;;0x000F001F;;;LS)(A;;0x00000004;;;IU)", SDDL_REVISION_1, &shm_psd, NULL)) {
+			L"D:(A;;0x000F001F;;;SY)(A;;0x000F001F;;;LS)(A;;0x00000006;;;IU)", SDDL_REVISION_1, &shm_psd, NULL)) {
 		ERR("Failed to create security descriptor for shared memory, error: %d\n", GetLastError());
 		CloseHandle(dve_event);
 		CloseHandle(hp_event);
@@ -1921,6 +2044,7 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 				DBGPRINT("call depature for Primary Index");
 				IddCxMonitorDeparture(g_monitorobject_list[PRIMARY_IDD_INDEX]);
 				g_monitorobject_list[PRIMARY_IDD_INDEX] = NULL;
+				g_monitor_identity[PRIMARY_IDD_INDEX].valid = FALSE;
 				d_edid = FALSE;
 			}
 			hdata.screen_present[3] = {0};
@@ -1939,6 +2063,7 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 						DBGPRINT("call depature for DISPLAY = %d\n", count);
 						IddCxMonitorDeparture(g_monitorobject_list[count]);
 						g_monitorobject_list[count] = NULL;
+						g_monitor_identity[count].valid = FALSE;
 						memset(minfo[count].pEdidBlock, 0, minfo[count].szEdidBlock);
 						dinfo.disp_count--;
 					} else {
@@ -1966,16 +2091,38 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 					if (memcmp(minfo[count].pEdidBlock, g_monitors[count].pEdidBlock, minfo->szEdidBlock) != 0) {
 						DBGPRINT("EDID changed for display = %d\n", count);
 
-						// Reset the edid block and copy the new edid block
-						memset(minfo[count].pEdidBlock, 0, minfo[count].szEdidBlock);
-						memcpy_s(minfo[count].pEdidBlock, minfo->szEdidBlock, g_monitors[count].pEdidBlock,
-								 minfo->szEdidBlock);
+						if (update_monitor_modes(g_monitorobject_list[count], &g_monitors[count]) ==
+							INTELVIRTDISPLAYUMD_SUCCESS) {
+							DBGPRINT("modes updated for DISPLAY = %d without departure\n", count);
 
-						// Remove the display and connect it again with fresh EDID
-						IddCxMonitorDeparture(g_monitorobject_list[count]);
-						g_monitorobject_list[count] = NULL;
-						pDeviceContextWrapper->pContext->FinishInit(count);
-						do_set_event = TRUE;
+							// Reset the edid block and copy the new edid block only after the mode
+							// update succeeded, so a failed update is retried on the next HPD event
+							// instead of being lost because the cached EDID already matches.
+							memset(minfo[count].pEdidBlock, 0, minfo[count].szEdidBlock);
+							memcpy_s(minfo[count].pEdidBlock, minfo->szEdidBlock, g_monitors[count].pEdidBlock,
+									 minfo->szEdidBlock);
+
+							// Publish the preferred mode so the enabler can apply it, updating the
+							// mode list alone does not change the resolution that is currently active.
+							DWORD preferred = g_monitors[count].ulPreferredModeIdx;
+							if (preferred < g_monitors[count].modes_count) {
+								dinfo.width[count] = g_monitors[count].pModeList[preferred].Width;
+								dinfo.height[count] = g_monitors[count].pModeList[preferred].Height;
+								dinfo.refresh_rate[count] = g_monitors[count].pModeList[preferred].VSync;
+								dinfo.pending[count] = 1;
+								DBGPRINT("resize requested for DISPLAY = %d, %dx%d@%d\n", count, dinfo.width[count],
+										 dinfo.height[count], dinfo.refresh_rate[count]);
+							}
+							do_set_event = TRUE;
+						} else {
+							ERR("update modes failed for DISPLAY = %d, retaining cached EDID for retry\n", count);
+						}
+						//} else {
+						//	// Remove the display and connect it again with fresh EDID
+						//	IddCxMonitorDeparture(g_monitorobject_list[count]);
+						//	g_monitorobject_list[count] = NULL;
+						//	pDeviceContextWrapper->pContext->FinishInit(count);
+						//}
 					} else {
 						DBGPRINT("No changes in DISPLAY = %d\n", count);
 					}
@@ -1989,6 +2136,37 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 				DBGPRINT("disp_count = %d", dinfo.disp_count);
 				WaitForSingleObject(hDispMutex, INFINITE);
 				pSharedMem->disp_count = dinfo.disp_count;
+				for (count = 0; count < MAX_SCAN_OUT; count++) {
+					pSharedMem->screen_present[count] = (g_monitorobject_list[count] != NULL) ? 1 : 0;
+					// A departed screen cannot have its request applied any more, so drop it
+					// and bump the generation so a late acknowledgement is rejected.
+					if (pSharedMem->screen_present[count] == 0) {
+						if (pSharedMem->pending[count]) {
+							pSharedMem->pending[count] = 0;
+							pSharedMem->width[count] = 0;
+							pSharedMem->height[count] = 0;
+							pSharedMem->refresh_rate[count] = 0;
+							pSharedMem->generation[count]++;
+						}
+					}
+					// Publish the display target identity every time, the enabler needs it to
+					// match the connector onto the owning display path.
+					pSharedMem->adapter_id[count] = g_monitor_identity[count].adapter_id;
+					pSharedMem->target_id[count] = g_monitor_identity[count].target_id;
+					pSharedMem->identity_valid[count] = g_monitor_identity[count].valid ? 1 : 0;
+					// Only overwrite a request that is still waiting to be applied, an
+					// entry the enabler has already acknowledged must not be resurrected.
+					if (dinfo.pending[count]) {
+						pSharedMem->width[count] = dinfo.width[count];
+						pSharedMem->height[count] = dinfo.height[count];
+						pSharedMem->refresh_rate[count] = dinfo.refresh_rate[count];
+						pSharedMem->pending[count] = 1;
+						// A new request supersedes whatever was there, so give it a fresh
+						// generation. An enabler still applying the previous request will
+						// then fail to acknowledge and this one stays pending.
+						pSharedMem->generation[count]++;
+					}
+				}
 				ReleaseMutex(hDispMutex);
 				status = SetEvent(dve_event);
 				if (status == NULL) {
@@ -1996,6 +2174,9 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 				}
 			}
 			do_set_event = FALSE;
+			// The published request stays in shared memory until the enabler clears the
+			// pending flag, so only the local staging copy is reset here.
+			memset(dinfo.pending, 0, sizeof(dinfo.pending));
 
 		} else if (waitstatus == WAIT_OBJECT_0 + 1) {
 			DBGPRINT("UMD is entering D3 state so kill the HPD thread");
@@ -2012,6 +2193,7 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 			minfo[count].status = FALSE;
 			IddCxMonitorDeparture(g_monitorobject_list[count]);
 			g_monitorobject_list[count] = NULL;
+			g_monitor_identity[count].valid = FALSE;
 		}
 	}
 

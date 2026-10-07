@@ -90,6 +90,7 @@ struct edid_info
 {
 	unsigned char edid_data[256];
 	unsigned int mode_size;
+	unsigned int preferred_mode_index;
 	unsigned int screen_num;
 	struct mode_info mode_list[MODE_LIST_MAX_SIZE];
 };

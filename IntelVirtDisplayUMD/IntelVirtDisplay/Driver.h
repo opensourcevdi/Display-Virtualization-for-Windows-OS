@@ -63,6 +63,7 @@ struct IndirectSampleMonitor
 		DWORD VSync;
 	} pModeList[szModeList];
 	DWORD ulPreferredModeIdx;
+	DWORD modes_count;
 };
 
 /// <summary>
@@ -202,6 +203,30 @@ DWORD GetGpuDeviceId();
 struct disp_info
 {
 	int disp_count;
+	// Per-screen resolution published by the UMD on a resize so the enabler can
+	// apply the new mode. A zero width/height means there is nothing to apply.
+	unsigned int width[MAX_SCAN_OUT];
+	unsigned int height[MAX_SCAN_OUT];
+	unsigned int refresh_rate[MAX_SCAN_OUT];
+	// Which screens are currently connected. The enabler walks the active IDD
+	// paths in order, so it needs this to map the n'th path back to the screen
+	// index used above when the connected screens are not contiguous.
+	unsigned int screen_present[MAX_SCAN_OUT];
+	// Set by the UMD when a new resolution is published and cleared by the enabler
+	// only after it has been applied, so a failed or missed apply is retried on the
+	// next event instead of being dropped.
+	unsigned int pending[MAX_SCAN_OUT];
+	// Windows display target identity reported by IddCxMonitorArrival, this is the
+	// display adapter LUID and not the render adapter LUID. It is the only reliable
+	// key to map a connector onto its DISPLAYCONFIG_PATH_INFO, path enumeration
+	// order is not guaranteed to follow the connector order.
+	LUID adapter_id[MAX_SCAN_OUT];
+	unsigned int target_id[MAX_SCAN_OUT];
+	unsigned int identity_valid[MAX_SCAN_OUT];
+	// Bumped by the UMD every time a request is published or invalidated. The
+	// enabler acknowledges only the generation it actually applied, so a request
+	// that was replaced while a mode set was in flight is not falsely cleared.
+	unsigned long long generation[MAX_SCAN_OUT];
 };
 
 struct monitor_info

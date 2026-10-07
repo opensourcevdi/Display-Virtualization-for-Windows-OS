@@ -918,6 +918,11 @@ VOID VioGpuAdapterLite::CopyResolution(UINT32 screen_num, struct edid_info *edat
 		edata->mode_list[i].height = m_screen[screen_num].gpu_disp_mode_ext[i].YResolution;
 		edata->mode_list[i].refreshrate = m_screen[screen_num].gpu_disp_mode_ext[i].refresh;
 	}
+
+	edata->preferred_mode_index = m_screen[screen_num].mode_list.preferred_mode_index;
+
+	if (edata->preferred_mode_index >= limit)
+		edata->preferred_mode_index = 0;
 }
 
 void VioGpuAdapterLite::AddEdidModes(UINT32 screen_num)

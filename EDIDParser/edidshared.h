@@ -9,6 +9,7 @@
 #define __EDID_SHARED_H__
 
 #define OUTPUT_MODELIST_SIZE 32
+#define OUTPUT_MODE_INDEX_INVALID ((unsigned int)-1)
 
 struct edid_qemu_modes
 {
@@ -21,6 +22,7 @@ struct output_modelist
 {
 	struct edid_qemu_modes modelist[OUTPUT_MODELIST_SIZE];
 	unsigned int modelist_size;
+	unsigned int preferred_mode_index;
 };
 
 int parse_edid_data(unsigned char *, struct output_modelist *);

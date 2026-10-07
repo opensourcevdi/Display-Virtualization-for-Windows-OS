@@ -128,6 +128,10 @@ int intelvirtdisplayenabler_init()
 			goto end;
 		}
 
+		// Apply the resolution published by IntelVirtDisplayUMD on a resize. Updating the
+		// IDD mode list only makes the mode available, it does not make it active.
+		ApplyResolution(&dinfo);
+
 		/* Step 1: Retrieve information about all possible display paths for all display devices */
 		if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, path_list.data(), &mode_count, mode_list.data(),
 							   nullptr) != ERROR_SUCCESS) {
@@ -252,6 +256,285 @@ int GetDisplayCount(disp_info *pdinfo)
 
 	WaitForSingleObject(hDispMutex, INFINITE);
 	*pdinfo = *pSharedMem;
+	ReleaseMutex(hDispMutex);
+
+	CloseHandle(hDispMutex);
+	UnmapViewOfFile(pSharedMem);
+	CloseHandle(hSharedMem);
+
+	return INTELVIRTDISPLAYENABLER_SUCCESS;
+}
+
+/*******************************************************************************
+ *
+ * Description
+ *
+ * same_luid - Compares two LUIDs. A LUID is not a scalar, so both halves have
+ * to be compared to identify a display adapter.
+ *
+ * Parameters
+ * left, right - the LUIDs to compare
+ *
+ * Return val
+ * bool - true when both LUIDs are identical
+ *
+ ******************************************************************************/
+static bool same_luid(const LUID &left, const LUID &right)
+{
+	return (left.LowPart == right.LowPart) && (left.HighPart == right.HighPart);
+}
+
+/*******************************************************************************
+ *
+ * Description
+ *
+ * ApplyResolution - Applies the per screen resolution published by
+ * IntelVirtDisplayUMD after a resize. IddCxMonitorUpdateModes only refreshes the
+ * mode list reported by the monitor, the OS keeps running the mode it already
+ * selected, so the new resolution has to be committed from user mode here.
+ *
+ * Parameters
+ * pdinfo - pointer to the disp_info read from the shared memory section
+ *
+ * Return val
+ * int - 0 == SUCCESS, -1 = ERROR
+ *
+ ******************************************************************************/
+int ApplyResolution(const disp_info *pdinfo)
+{
+	unsigned int path_count = 0, mode_count = 0;
+	int ret = INTELVIRTDISPLAYENABLER_SUCCESS;
+
+	if (pdinfo == NULL) {
+		return INTELVIRTDISPLAYENABLER_FAILURE;
+	}
+
+	// Nothing was published, so there is no resize to apply.
+	bool resize_pending = false;
+	for (int screen = 0; screen < MAX_SCAN_OUT; screen++) {
+		if (pdinfo->pending[screen] && pdinfo->identity_valid[screen] && (pdinfo->width[screen] != 0) &&
+			(pdinfo->height[screen] != 0)) {
+			resize_pending = true;
+			break;
+		}
+	}
+	if (!resize_pending) {
+		return INTELVIRTDISPLAYENABLER_SUCCESS;
+	}
+
+	if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) != ERROR_SUCCESS) {
+		ERR("GetDisplayConfigBufferSizes failed in ApplyResolution (%d)\n", GetLastError());
+		return INTELVIRTDISPLAYENABLER_FAILURE;
+	}
+
+	std::vector<DISPLAYCONFIG_PATH_INFO> path_list(path_count);
+	std::vector<DISPLAYCONFIG_MODE_INFO> mode_list(mode_count);
+
+	if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, path_list.data(), &mode_count, mode_list.data(),
+						   nullptr) != ERROR_SUCCESS) {
+		ERR("QueryDisplayConfig failed in ApplyResolution (%d)\n", GetLastError());
+		return INTELVIRTDISPLAYENABLER_FAILURE;
+	}
+
+	bool mode_changed = false;
+	std::vector<disp_resolution_ack> applied_resolutions;
+	// GDI source paths already driven in this pass. In a clone topology several
+	// targets share one source, so two connectors can resolve to the same device
+	// name and the second mode set would silently overwrite the first.
+	std::vector<std::wstring> applied_sources;
+
+	// Walk the requests, not the paths. Each connector carries the display target
+	// identity the OS handed to the UMD at monitor arrival, so the owning path can
+	// be located exactly. Relying on the IDD paths being enumerated in connector
+	// order is only an assumption and would silently resize the wrong display.
+	for (unsigned int cur_screen = 0; cur_screen < MAX_SCAN_OUT; cur_screen++) {
+		if (pdinfo->pending[cur_screen] == 0) {
+			continue;
+		}
+
+		unsigned int width = pdinfo->width[cur_screen];
+		unsigned int height = pdinfo->height[cur_screen];
+		unsigned int refresh_rate = pdinfo->refresh_rate[cur_screen];
+		if ((width == 0) || (height == 0)) {
+			continue;
+		}
+
+		if (pdinfo->identity_valid[cur_screen] == 0) {
+			ERR("No display identity for screen %d, leaving the request pending\n", cur_screen);
+			ret = INTELVIRTDISPLAYENABLER_FAILURE;
+			continue;
+		}
+
+		bool matched = false;
+		for (auto &path : path_list) {
+			if (!same_luid(path.targetInfo.adapterId, pdinfo->adapter_id[cur_screen]) ||
+				(path.targetInfo.id != pdinfo->target_id[cur_screen])) {
+				continue;
+			}
+			matched = true;
+
+			// Resolve the GDI device name for this path, ChangeDisplaySettingsEx works on it.
+			DISPLAYCONFIG_SOURCE_DEVICE_NAME sourceName = {};
+			sourceName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+			sourceName.header.size = sizeof(sourceName);
+			sourceName.header.adapterId = path.sourceInfo.adapterId;
+			sourceName.header.id = path.sourceInfo.id;
+			if (DisplayConfigGetDeviceInfo(&sourceName.header) != ERROR_SUCCESS) {
+				ERR("Failed to get source name for screen %d\n", cur_screen);
+				ret = INTELVIRTDISPLAYENABLER_FAILURE;
+				break;
+			}
+
+			// Another connector is already driving this source, so applying here would
+			// overwrite that mode. Leave the request pending rather than clobber it.
+			bool shared_source = false;
+			for (const std::wstring &applied : applied_sources) {
+				if (applied.compare(sourceName.viewGdiDeviceName) == 0) {
+					shared_source = true;
+					break;
+				}
+			}
+			if (shared_source) {
+				ERR("Screen %d shares source %ws with another pending request; "
+					"independent clone resizing is not supported\n",
+					cur_screen, sourceName.viewGdiDeviceName);
+				ret = INTELVIRTDISPLAYENABLER_FAILURE;
+				break;
+			}
+
+			DEVMODE devmode = {0};
+			devmode.dmSize = sizeof(devmode);
+			if (!EnumDisplaySettings(sourceName.viewGdiDeviceName, ENUM_CURRENT_SETTINGS, &devmode)) {
+				ERR("EnumDisplaySettings failed for %ws (%d)\n", sourceName.viewGdiDeviceName, GetLastError());
+				ret = INTELVIRTDISPLAYENABLER_FAILURE;
+				break;
+			}
+
+			// Already running the requested mode, avoid a redundant mode set. The request
+			// is still acknowledged, the requested state is what is on screen.
+			if ((devmode.dmPelsWidth == width) && (devmode.dmPelsHeight == height)) {
+				applied_resolutions.push_back({cur_screen, pdinfo->generation[cur_screen]});
+				applied_sources.push_back(sourceName.viewGdiDeviceName);
+				break;
+			}
+
+			devmode.dmPelsWidth = width;
+			devmode.dmPelsHeight = height;
+			devmode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+			if (refresh_rate != 0) {
+				devmode.dmDisplayFrequency = refresh_rate;
+				devmode.dmFields |= DM_DISPLAYFREQUENCY;
+			}
+
+			LONG status = ChangeDisplaySettingsEx(sourceName.viewGdiDeviceName, &devmode, NULL,
+												  CDS_UPDATEREGISTRY | CDS_NORESET, NULL);
+			if (status != DISP_CHANGE_SUCCESSFUL) {
+				ERR("ChangeDisplaySettingsEx failed for screen %d (%ws) with %d\n", cur_screen,
+					sourceName.viewGdiDeviceName, status);
+				ret = INTELVIRTDISPLAYENABLER_FAILURE;
+				break;
+			}
+
+			DBGPRINT("Applied resolution %dx%d on screen %d (%ws) adapter=%08X:%08X target=%d generation=%I64u\n",
+					 width, height, cur_screen, sourceName.viewGdiDeviceName,
+					 (unsigned int)pdinfo->adapter_id[cur_screen].HighPart,
+					 (unsigned int)pdinfo->adapter_id[cur_screen].LowPart, pdinfo->target_id[cur_screen],
+					 pdinfo->generation[cur_screen]);
+			applied_resolutions.push_back({cur_screen, pdinfo->generation[cur_screen]});
+			applied_sources.push_back(sourceName.viewGdiDeviceName);
+			mode_changed = true;
+			break;
+		}
+
+		if (!matched) {
+			// The display is not in the active path list, so the request cannot be applied
+			// yet. Leave it pending instead of guessing at another path.
+			ERR("No active display path matched screen %d adapter=%08X:%08X target=%d\n", cur_screen,
+				(unsigned int)pdinfo->adapter_id[cur_screen].HighPart,
+				(unsigned int)pdinfo->adapter_id[cur_screen].LowPart, pdinfo->target_id[cur_screen]);
+			ret = INTELVIRTDISPLAYENABLER_FAILURE;
+		}
+	}
+
+	// Commit all the cached changes in one go.
+	if (mode_changed) {
+		if (ChangeDisplaySettingsEx(NULL, NULL, NULL, 0, NULL) != DISP_CHANGE_SUCCESSFUL) {
+			ERR("ChangeDisplaySettingsEx commit failed\n");
+			// The commit failed, so nothing was applied. Leave every request pending so
+			// it is retried on the next event instead of being silently dropped.
+			applied_resolutions.clear();
+			ret = INTELVIRTDISPLAYENABLER_FAILURE;
+		}
+	}
+
+	if (!applied_resolutions.empty()) {
+		ClearPendingResolutions(applied_resolutions);
+	}
+
+	return ret;
+}
+
+/*******************************************************************************
+ *
+ * Description
+ *
+ * ClearPendingResolutions - Acknowledges the resize requests that have been
+ * applied by clearing their pending flag in the shared memory section. The
+ * generation is re-checked under the mutex, so a request that the UMD replaced
+ * while the mode set was in flight is left pending for the next pass instead of
+ * being acknowledged by mistake.
+ *
+ * Parameters
+ * applied_resolutions - connector index and generation of each applied request
+ *
+ * Return val
+ * int - 0 == SUCCESS, -1 = ERROR
+ *
+ ******************************************************************************/
+int ClearPendingResolutions(const std::vector<disp_resolution_ack> &applied_resolutions)
+{
+	HANDLE hSharedMem = OpenFileMapping(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, DISP_INFO);
+	if (hSharedMem == NULL) {
+		ERR("Failed to open shared memory section for write (%d)\n", GetLastError());
+		return INTELVIRTDISPLAYENABLER_FAILURE;
+	}
+
+	struct disp_info *pSharedMem =
+		(struct disp_info *)MapViewOfFile(hSharedMem, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
+	if (pSharedMem == NULL) {
+		ERR("Failed to map view of shared memory section for write (%d)\n", GetLastError());
+		CloseHandle(hSharedMem);
+		return INTELVIRTDISPLAYENABLER_FAILURE;
+	}
+
+	HANDLE hDispMutex = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, DISP_INFO_MUTEX);
+	if (hDispMutex == NULL) {
+		ERR("Failed to open named mutex for shared memory (%d)\n", GetLastError());
+		UnmapViewOfFile(pSharedMem);
+		CloseHandle(hSharedMem);
+		return INTELVIRTDISPLAYENABLER_FAILURE;
+	}
+
+	WaitForSingleObject(hDispMutex, INFINITE);
+	for (const disp_resolution_ack &ack : applied_resolutions) {
+		if (ack.connector_index >= MAX_SCAN_OUT) {
+			continue;
+		}
+
+		// The UMD published a newer request while this one was being applied, so the
+		// applied mode is already stale. Leave it pending to be retried.
+		if (pSharedMem->generation[ack.connector_index] != ack.generation) {
+			DBGPRINT("Screen %d was superseded while applying (applied generation %I64u, "
+					 "current %I64u), leaving it pending\n",
+					 ack.connector_index, ack.generation, pSharedMem->generation[ack.connector_index]);
+			continue;
+		}
+
+		pSharedMem->pending[ack.connector_index] = 0;
+		pSharedMem->width[ack.connector_index] = 0;
+		pSharedMem->height[ack.connector_index] = 0;
+		pSharedMem->refresh_rate[ack.connector_index] = 0;
+	}
 	ReleaseMutex(hDispMutex);
 
 	CloseHandle(hDispMutex);

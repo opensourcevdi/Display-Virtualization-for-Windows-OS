@@ -42,24 +42,24 @@ static inline int add_mode(struct output_modelist *l, unsigned w, unsigned h, do
  ******************************************************************************/
 int parse_edid_data(unsigned char *edid_data, struct output_modelist *kmd_modelist)
 {
-	int func_result = -1;
-	int index = 0;
+	if (edid_data == NULL || kmd_modelist == NULL)
+		return -1;
 
-	func_result = validate_edid_header(edid_data);
-	if (func_result != 0) {
-		return func_result;
-	}
-	func_result = -1;
-	func_result = validate_edid_checksum(edid_data);
-	if (func_result != 0) {
-		return func_result;
-	}
+	kmd_modelist->modelist_size = 0;
+	kmd_modelist->preferred_mode_index = OUTPUT_MODE_INDEX_INVALID;
+
+	if (validate_edid_header(edid_data) != 0)
+		return -1;
+
+	if (validate_edid_checksum(edid_data) != 0)
+		return -1;
 
 	get_timing_bitmaps_modes(edid_data, kmd_modelist);
 	get_standard_modes(edid_data, kmd_modelist);
 	get_cea_modes(edid_data, kmd_modelist);
 	get_detailed_timing_descriptor_modes(edid_data, kmd_modelist);
 	get_additional_standard_display_modes(edid_data, kmd_modelist);
+
 	return 0;
 }
 
@@ -433,8 +433,14 @@ static inline void get_detailed_timing_descriptor_modes(unsigned char *edid_data
 
 			/* Guard against malformed DTD: skip descriptor if totals are zero to prevent divide-by-zero */
 			if (dtd_h_total != 0 && dtd_v_total != 0) {
+				unsigned int mode_index = kmd_modelist->modelist_size;
+
 				dtd_refresh_rate = dtd_pixel_clk / (dtd_h_total * dtd_v_total);
-				add_mode(kmd_modelist, dtd_h_active, dtd_v_active, dtd_refresh_rate);
+
+				if (add_mode(kmd_modelist, dtd_h_active, dtd_v_active, dtd_refresh_rate) == 0 &&
+					kmd_modelist->preferred_mode_index == OUTPUT_MODE_INDEX_INVALID) {
+					kmd_modelist->preferred_mode_index = mode_index;
+				}
 			}
 		}
 		i = (i + DTD_STANDARD_DESC_SIZE);

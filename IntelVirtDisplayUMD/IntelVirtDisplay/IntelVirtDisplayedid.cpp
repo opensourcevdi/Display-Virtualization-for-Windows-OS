@@ -43,7 +43,9 @@ int get_edid_data(HANDLE devHandle, void *m, DWORD id, BOOL d_edid)
 	memset(err, 0, 256);
 
 	IndirectSampleMonitor *monitor = (IndirectSampleMonitor *)m;
-	unsigned int i = 0, edid_mode_index = 0;
+	unsigned int i = 0;
+	unsigned int edid_mode_index = 0;
+	BOOL preferred_mode_found = FALSE;
 
 	if (!devHandle || !m) {
 		ERR("Invalid parameter\n");
@@ -72,7 +74,8 @@ int get_edid_data(HANDLE devHandle, void *m, DWORD id, BOOL d_edid)
 			 {1600, 1200, 60},
 			 {1024, 768, 60},
 		 },
-		 0},
+		 0,
+		 3},
 	};
 
 	if (d_edid == TRUE) {
@@ -86,6 +89,7 @@ int get_edid_data(HANDLE devHandle, void *m, DWORD id, BOOL d_edid)
 		ERR("Failed to allocate edid structure\n");
 		return INTELVIRTDISPLAYUMD_FAILURE;
 	}
+
 	SecureZeroMemory(edata, sizeof(struct edid_info));
 	edata->screen_num = id;
 
@@ -98,14 +102,17 @@ int get_edid_data(HANDLE devHandle, void *m, DWORD id, BOOL d_edid)
 		free(edata);
 		return INTELVIRTDISPLAYUMD_FAILURE;
 	}
+
 	if (edata->mode_size > MODE_LIST_MAX_SIZE) {
-		ERR("Invalid id \n");
+		ERR("Invalid mode count\n");
 		free(edata);
 		return INTELVIRTDISPLAYUMD_FAILURE;
 	}
 
 	memcpy_s(monitor->pEdidBlock, monitor->szEdidBlock, edata->edid_data, monitor->szEdidBlock);
+	SecureZeroMemory(monitor->pModeList, sizeof(monitor->pModeList));
 	monitor->ulPreferredModeIdx = 0;
+	monitor->modes_count = 0;
 
 	DBGPRINT("Modes\n");
 	for (i = 0; i < edata->mode_size; i++) {
@@ -119,10 +126,27 @@ int get_edid_data(HANDLE devHandle, void *m, DWORD id, BOOL d_edid)
 				monitor->pModeList[edid_mode_index].VSync = REFRESH_RATE_60;
 			else
 				monitor->pModeList[edid_mode_index].VSync = (DWORD)edata->mode_list[i].refreshrate;
+
+			if (i == edata->preferred_mode_index) {
+				monitor->ulPreferredModeIdx = edid_mode_index;
+				preferred_mode_found = TRUE;
+			}
+
 			DBGPRINT("[%d]: %dx%d@%d\n", edid_mode_index, monitor->pModeList[edid_mode_index].Width,
 					 monitor->pModeList[edid_mode_index].Height, monitor->pModeList[edid_mode_index].VSync);
 			edid_mode_index++;
 		}
+	}
+
+	monitor->modes_count = edid_mode_index;
+	if (monitor->modes_count == 0) {
+		ERR("No supported modes were returned by the EDID\n");
+		free(edata);
+		return INTELVIRTDISPLAYUMD_FAILURE;
+	}
+
+	if (!preferred_mode_found) {
+		monitor->ulPreferredModeIdx = 0;
 	}
 
 	free(edata);
