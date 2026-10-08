@@ -891,6 +891,7 @@ BOOLEAN VioGpuAdapterLite::GetEdids(UINT32 screen_num)
 	KeWaitForMutexObject(&m_screen_mutex, Executive, KernelMode, FALSE, NULL);
 	if (m_CtrlQueue.AskEdidInfo(&vbuf, screen_num, &m_screen[screen_num].m_EdidEvent) &&
 		m_CtrlQueue.GetEdidInfo(vbuf, screen_num, m_screen[screen_num].m_EDIDs)) {
+		patch_edid_range_limits(m_screen[screen_num].m_EDIDs);
 		m_bEDID = TRUE;
 	}
 	KeReleaseMutex(&m_screen_mutex, FALSE);
