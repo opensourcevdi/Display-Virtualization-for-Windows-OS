@@ -952,6 +952,20 @@ void VioGpuAdapterLite::AddEdidModes(UINT32 screen_num)
 				(USHORT)m_screen[screen_num].mode_list.modelist[i].height;
 			m_screen[screen_num].gpu_disp_mode_ext[i].refresh = m_screen[screen_num].mode_list.modelist[i].refresh_rate;
 		}
+
+		/* Clamp only the preferred mode to the supported resolution range */
+		unsigned int pref = m_screen[screen_num].mode_list.preferred_mode_index;
+		if (pref < limit) {
+			PGPU_DISP_MODE_EXT pMode = &m_screen[screen_num].gpu_disp_mode_ext[pref];
+			USHORT xres = (USHORT)min(max(pMode->XResolution, MIN_WIDTH_SIZE), MAX_WIDTH_SIZE);
+			USHORT yres = (USHORT)min(max(pMode->YResolution, MIN_HEIGHT_SIZE), MAX_HEIGHT_SIZE);
+			if (xres != pMode->XResolution || yres != pMode->YResolution) {
+				DBGPRINT("Clamping preferred mode %d (%dx%d) to (%dx%d)\n", pref, pMode->XResolution,
+						 pMode->YResolution, xres, yres);
+				pMode->XResolution = xres;
+				pMode->YResolution = yres;
+			}
+		}
 	}
 }
 
