@@ -2091,7 +2091,16 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 					if (memcmp(minfo[count].pEdidBlock, g_monitors[count].pEdidBlock, minfo->szEdidBlock) != 0) {
 						DBGPRINT("EDID changed for display = %d\n", count);
 
-						if (update_monitor_modes(g_monitorobject_list[count], &g_monitors[count]) ==
+						DWORD preferred = g_monitors[count].ulPreferredModeIdx;
+						if (preferred > g_monitors[count].modes_count) {
+							ERR("Preferred mode index %d is out of range for display = %d, using 0 instead\n", preferred,
+								count);
+						} else if ( dinfo.width[count] == g_monitors[count].pModeList[preferred].Width &&
+								dinfo.height[count] == g_monitors[count].pModeList[preferred].Height &&
+								dinfo.refresh_rate[count] == g_monitors[count].pModeList[preferred].VSync) {
+							DBGPRINT("Preferred mode already applied for display = %d, no resize requested\n", count);
+
+						} else if  (update_monitor_modes(g_monitorobject_list[count], &g_monitors[count]) ==
 							INTELVIRTDISPLAYUMD_SUCCESS) {
 							DBGPRINT("modes updated for DISPLAY = %d without departure\n", count);
 
@@ -2104,15 +2113,13 @@ int hpd_event_create(IDDCX_ADAPTER AdapterObject)
 
 							// Publish the preferred mode so the enabler can apply it, updating the
 							// mode list alone does not change the resolution that is currently active.
-							DWORD preferred = g_monitors[count].ulPreferredModeIdx;
-							if (preferred < g_monitors[count].modes_count) {
-								dinfo.width[count] = g_monitors[count].pModeList[preferred].Width;
-								dinfo.height[count] = g_monitors[count].pModeList[preferred].Height;
-								dinfo.refresh_rate[count] = g_monitors[count].pModeList[preferred].VSync;
-								dinfo.pending[count] = 1;
-								DBGPRINT("resize requested for DISPLAY = %d, %dx%d@%d\n", count, dinfo.width[count],
-										 dinfo.height[count], dinfo.refresh_rate[count]);
-							}
+							dinfo.width[count] = g_monitors[count].pModeList[preferred].Width;
+							dinfo.height[count] = g_monitors[count].pModeList[preferred].Height;
+							dinfo.refresh_rate[count] = g_monitors[count].pModeList[preferred].VSync;
+							dinfo.pending[count] = 1;
+							DBGPRINT("resize requested for DISPLAY = %d, %dx%d@%d\n", count, dinfo.width[count],
+										dinfo.height[count], dinfo.refresh_rate[count]);
+
 							do_set_event = TRUE;
 						} else {
 							ERR("update modes failed for DISPLAY = %d, retaining cached EDID for retry\n", count);
