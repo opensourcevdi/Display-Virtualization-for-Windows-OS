@@ -22,6 +22,7 @@
 #include <cfgmgr32.h>
 
 #include "Trace.h"
+#include "D3D12FrameCopier.h"
 #include "IntelVirtDisplayedid.h"
 #include "..\..\IntelVirtDisplayKMD\Public.h"
 
@@ -141,6 +142,14 @@ private:
 	void *m_last_reported_addr;
 	BOOL m_staging_addr_valid;
 
+	// Device local memory path: frames are copied on the GPU into a D3D12 GPU
+	// upload heap buffer whose guest physical addresses lie in the render
+	// GPU's (VF) memory BAR, so the host imports them as a VFIO dmabuf without
+	// any copy through system memory. Falls back to the staging texture above
+	// when unavailable.
+	std::unique_ptr<D3D12FrameCopier> m_d3d12_copier;
+	BOOL m_use_device_mem;
+
 	// IOCTL related buffers
 	ULONG m_ioctlresp_size;
 	struct FrameMetaData *m_framedata;
@@ -152,6 +161,10 @@ private:
 	IDARG_OUT_QUERY_HWCURSOR2 m_outputargs;
 	IDARG_OUT_QUERY_HWCURSOR m0_outputargs;
 	HANDLE m_cursorthread_handle;
+
+	BOOL setup_device_mem_target();
+	void disable_device_mem(BOOL permanently);
+	void release_kmd_framebuffer();
 
 	void GetCursorData();
 	void ProcessCursorDataLegacy(UINT *tempshapeid, INT *tempX, INT *tempY);

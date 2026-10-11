@@ -35,11 +35,13 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="D3D12FrameCopier.cpp" />
     <ClCompile Include="Driver.cpp" />
     <ClCompile Include="IntelVirtDisplayedid.cpp" />
     <ClCompile Include="Tracing.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="D3D12FrameCopier.h" />
     <ClInclude Include="Driver.h" />
     <ClInclude Include="IntelVirtDisplaycommon.h" />
     <ClInclude Include="IntelVirtDisplayedid.h" />

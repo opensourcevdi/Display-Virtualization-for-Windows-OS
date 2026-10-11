@@ -72,6 +72,7 @@ ScreenInfo::ScreenInfo(void)
 	m_FbWidth = 0;
 	m_FbHeight = 0;
 	m_FbStride = 0;
+	m_FbDeviceMem = FALSE;
 	m_pCursorBuf = NULL;
 	m_FlushCount = 0;
 	m_FlushStallCount = 0;
@@ -81,6 +82,7 @@ ScreenInfo::ScreenInfo(void)
 	RtlZeroMemory(&m_DisplayInfoEvent.Header, sizeof(m_DisplayInfoEvent.Header));
 	RtlZeroMemory(&m_EdidEvent.Header, sizeof(m_EdidEvent.Header));
 	RtlZeroMemory(&m_FlushEvent.Header, sizeof(m_FlushEvent.Header));
+	KeInitializeEvent(&m_ScanoutEvent, NotificationEvent, FALSE);
 	KeInitializeMutex(&m_segmentMutex, 0);
 }
 
@@ -258,10 +260,19 @@ NTSTATUS VioGpuAdapterLite::SetCurrentModeExt(CURRENT_MODE *pCurrentMode)
 		// staging address, a new stride, or a resolution change. The backing
 		// pointer alone is not sufficient -- on a mode switch the allocator can
 		// hand back the same VA, so dimensions/stride must also be checked.
-		BOOLEAN backingChanged = (front == NULL) || (scr.m_FbSrcAddr != pCurrentMode->FrameBuffer.Ptr) ||
-								 (scr.m_FbWidth != pCurrentMode->DispInfo.Width) ||
-								 (scr.m_FbHeight != pCurrentMode->DispInfo.Height) ||
-								 (scr.m_FbStride != pCurrentMode->Stride);
+		BOOLEAN backingChanged =
+			(front == NULL) || (scr.m_FbSrcAddr != pCurrentMode->FrameBuffer.Ptr) ||
+			(scr.m_FbWidth != pCurrentMode->DispInfo.Width) || (scr.m_FbHeight != pCurrentMode->DispInfo.Height) ||
+			(scr.m_FbStride != pCurrentMode->Stride) || (scr.m_FbDeviceMem != pCurrentMode->DeviceMemory);
+
+		// Device local memory is not locked (there is no PFN to lock), so the
+		// GPU memory manager may relocate the allocation behind the same VA.
+		// The host would then keep scanning out the old VRAM range, so rebuild
+		// the resource whenever the physical backing moved.
+		if (!backingChanged && pCurrentMode->DeviceMemory && !scr.m_FrameSegment.IsDeviceBackingStable()) {
+			ERR("screen %d: device memory backing moved, rebuilding scanout resource\n", targetId);
+			backingChanged = TRUE;
+		}
 
 		if (backingChanged) {
 			if (front != NULL) {
@@ -271,7 +282,16 @@ NTSTATUS VioGpuAdapterLite::SetCurrentModeExt(CURRENT_MODE *pCurrentMode)
 			scr.m_FbWidth = pCurrentMode->DispInfo.Width;
 			scr.m_FbHeight = pCurrentMode->DispInfo.Height;
 			scr.m_FbStride = pCurrentMode->Stride;
+			scr.m_FbDeviceMem = pCurrentMode->DeviceMemory;
 			CreateFrameBufferObj(&scr.m_ModeInfo[idx], FrameBufSlot::Front, pCurrentMode);
+			if (pCurrentMode->DeviceMemory && scr.GetFrameBufferObj(FrameBufSlot::Front) == NULL) {
+				// Tell the UMD so it can fall back to a system memory staging
+				// buffer instead of presenting into a resource that does not exist.
+				ERR("screen %d: device memory framebuffer rejected\n", targetId);
+				scr.m_FbSrcAddr = NULL;
+				status = STATUS_NOT_SUPPORTED;
+				break;
+			}
 			DBGPRINT("screen %d: created persistent framebuffer (%d x %d) stride=%d\n", targetId,
 					 scr.m_ModeInfo[idx].VisScreenWidth, scr.m_ModeInfo[idx].VisScreenHeight, pCurrentMode->Stride);
 		} else {
@@ -319,6 +339,7 @@ NTSTATUS VioGpuAdapterLite::ReleaseFrameBuffer(UINT32 screen_num)
 	scr.m_FbWidth = 0;
 	scr.m_FbHeight = 0;
 	scr.m_FbStride = 0;
+	scr.m_FbDeviceMem = FALSE;
 
 	// Any flush still outstanding refers to the resource just destroyed; its
 	// completion will never be matched, so clear the back-pressure.
@@ -692,7 +713,8 @@ BOOLEAN FindUpdateRect(_In_ ULONG NumMoves, _In_ D3DKMT_MOVE_RECT *pMoves, _In_ 
 
 NTSTATUS VioGpuAdapterLite::ExecutePresentDisplayZeroCopy(_In_ BYTE *SrcAddr, _In_ UINT SrcBytesPerPixel,
 														  _In_ LONG SrcPitch, _In_ UINT SrcWidth, _In_ UINT SrcHeight,
-														  _In_ UINT ScreenNum, _In_ UINT Stride)
+														  _In_ UINT ScreenNum, _In_ UINT Stride,
+														  _In_ BOOLEAN DeviceMemory)
 {
 	PAGED_CODE();
 	TRACING();
@@ -706,6 +728,7 @@ NTSTATUS VioGpuAdapterLite::ExecutePresentDisplayZeroCopy(_In_ BYTE *SrcAddr, _I
 	tempCurrentMode.DispInfo.ColorFormat = D3DDDIFMT_X8R8G8B8;
 	tempCurrentMode.FrameBuffer.Ptr = SrcAddr;
 	tempCurrentMode.Stride = Stride;
+	tempCurrentMode.DeviceMemory = DeviceMemory;
 
 	// Lock order: m_segmentMutex must always be acquired BEFORE m_screen_mutex
 	// (m_screen_mutex is acquired inside SetCurrentModeExt).
@@ -1232,7 +1255,8 @@ VOID VioGpuAdapterLite::DpcRoutine(void)
 					break;
 				}
 				case VIRTIO_GPU_CMD_GET_DISPLAY_INFO:
-				case VIRTIO_GPU_CMD_GET_EDID: {
+				case VIRTIO_GPU_CMD_GET_EDID:
+				case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB: {
 					ASSERT(evnt);
 					KeSetEvent(evnt, IO_NO_INCREMENT, FALSE);
 				} break;
@@ -1380,7 +1404,8 @@ void VioGpuAdapterLite::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, 
 		if (m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment.GetFbVAddr()) {
 			m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment.Close();
 		}
-		if (!m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment.InitExt(size, pCurrentMode->FrameBuffer.Ptr)) {
+		if (!m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment.InitExt(size, pCurrentMode->FrameBuffer.Ptr,
+																			  pCurrentMode->DeviceMemory)) {
 			ERR("Failed to initialize external framebuffer segment\n");
 			m_Idr.PutId(resid);
 			return;
@@ -1408,14 +1433,29 @@ void VioGpuAdapterLite::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, 
 
 	// Clear the new scanout backing before the first flush so the host doesn't
 	// scan out the UMD's stale staging buffer for one frame during a mode change.
+	// Device memory is skipped: the UMD has already copied the current frame
+	// into it on the GPU, and clearing it would be a CPU write over the BAR.
 
-	if (obj->GetVirtualAddress()) {
+	if (obj->GetVirtualAddress() && !pCurrentMode->DeviceMemory) {
 		RtlZeroMemory(obj->GetVirtualAddress(), size);
 	}
 
 	if (m_bBlobSupported) {
-		m_CtrlQueue.SetScanoutBlob(pCurrentMode->DispInfo.TargetId, resid, pModeInfo->VisScreenWidth,
-								   pModeInfo->VisScreenHeight, format, 0, 0, pCurrentMode->Stride);
+		// For device memory, wait for the host's answer: a QEMU without VFIO
+		// dmabuf support (or a host kernel without it) cannot map the BAR
+		// backed blob and rejects the scanout. Report that to the UMD through
+		// a missing Front buffer so it falls back to system memory, instead of
+		// leaving the screen blank.
+		KEVENT *scanoutEvent =
+			pCurrentMode->DeviceMemory ? &m_screen[pCurrentMode->DispInfo.TargetId].m_ScanoutEvent : NULL;
+		if (!m_CtrlQueue.SetScanoutBlob(pCurrentMode->DispInfo.TargetId, resid, pModeInfo->VisScreenWidth,
+										pModeInfo->VisScreenHeight, format, 0, 0, pCurrentMode->Stride, scanoutEvent)) {
+			ERR("Host rejected the scanout blob for screen %d\n", pCurrentMode->DispInfo.TargetId);
+			m_CtrlQueue.SetScanout(pCurrentMode->DispInfo.TargetId, 0, 0, 0, 0, 0);
+			DestroyFrameBufferObj(&obj, FALSE);
+			m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment.Close();
+			return;
+		}
 	} else {
 		m_CtrlQueue.SetScanout(pCurrentMode->DispInfo.TargetId, resid, pModeInfo->VisScreenWidth,
 							   pModeInfo->VisScreenHeight, 0, 0);
@@ -1530,16 +1570,30 @@ BOOLEAN VioGpuAdapterLite::GpuObjectAttach(UINT res_id, VioGpuObj *obj, ULONGLON
 	// FIXME
 	RtlZeroMemory(ents, size);
 
+	// Merge physically contiguous pages into a single entry. Device local
+	// memory is usually contiguous, and QEMU turns every entry into a separate
+	// range of the VFIO dmabuf, so this keeps a 4K frame at a handful of
+	// ranges instead of thousands. The total length is unchanged.
+	UINT nents = 0;
 	for (UINT i = 0; i < sgl->NumberOfElements; i++) {
-		ents[i].addr = sgl->Elements[i].Address.QuadPart;
-		ents[i].length = sgl->Elements[i].Length;
-		ents[i].padding = 0;
+		ULONGLONG addr = sgl->Elements[i].Address.QuadPart;
+		ULONG length = sgl->Elements[i].Length;
+		if (nents > 0 && ents[nents - 1].addr + ents[nents - 1].length == addr &&
+			ents[nents - 1].length <= MAXULONG - length) {
+			ents[nents - 1].length += length;
+			continue;
+		}
+		ents[nents].addr = addr;
+		ents[nents].length = length;
+		ents[nents].padding = 0;
+		nents++;
 	}
+	DBGPRINT("res %d: %d pages in %d backing entries\n", res_id, sgl->NumberOfElements, nents);
 
 	if (m_bBlobSupported) {
-		m_CtrlQueue.CreateResourceBlob(res_id, ents, sgl->NumberOfElements, width, height, stride);
+		m_CtrlQueue.CreateResourceBlob(res_id, ents, nents, width, height, stride);
 	} else {
-		m_CtrlQueue.AttachBacking(res_id, ents, sgl->NumberOfElements);
+		m_CtrlQueue.AttachBacking(res_id, ents, nents);
 	}
 
 	obj->SetId(res_id);

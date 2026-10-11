@@ -90,15 +90,24 @@ public:
 	PHYSICAL_ADDRESS GetPhysicalAddress(void);
 	PSCATTER_GATHER_LIST GetSGList(void) { return m_pSGList; }
 	BOOLEAN Init(_In_ UINT size, _In_ PPHYSICAL_ADDRESS pPAddr);
-	BOOLEAN InitExt(_In_ UINT size, _In_ PVOID pUserAddr);
+	BOOLEAN InitExt(_In_ UINT size, _In_ PVOID pUserAddr, _In_ BOOLEAN bDeviceMemory);
 	BOOLEAN IsSystemMemory(void) { return m_bSystemMemory; }
+	BOOLEAN IsDeviceMemory(void) { return m_bDeviceMemory; }
+	BOOLEAN IsDeviceBackingStable(void);
 	void Close(void);
 	PVOID GetFbVAddr() { return m_pVAddr; }
 
 private:
+	BOOLEAN InitDeviceMemory(_In_ UINT size, _In_ PVOID pUserAddr);
+
 	BOOLEAN m_bSystemMemory;
 	BOOLEAN m_bUserMemory;
 	BOOLEAN m_bMapped;
+	// User VA mapping device local memory; the pages are resolved but not
+	// locked, see InitDeviceMemory().
+	BOOLEAN m_bDeviceMemory;
+	// Rotates through the pages checked by IsDeviceBackingStable().
+	UINT m_uVerifyCursor;
 	PSCATTER_GATHER_LIST m_pSGList;
 	PVOID m_pVAddr;
 	PMDL m_pMdl;
@@ -179,7 +188,8 @@ public:
 	void UnrefResource(UINT id);
 	void InvalBacking(UINT id);
 	void SetScanout(UINT scan_id, UINT res_id, UINT width, UINT height, UINT x, UINT y);
-	void SetScanoutBlob(UINT scan_id, UINT res_id, UINT width, UINT height, UINT format, UINT x, UINT y, UINT stride);
+	BOOLEAN SetScanoutBlob(UINT scan_id, UINT res_id, UINT width, UINT height, UINT format, UINT x, UINT y, UINT stride,
+						   KEVENT *event = NULL);
 	void ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y, UINT screen_num, KEVENT *event);
 	void TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y, PUINT fence_id);
 	void AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents);

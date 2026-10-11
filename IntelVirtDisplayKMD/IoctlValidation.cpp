@@ -140,6 +140,11 @@ NTSTATUS ValidateIoctl(const void *data, const WDFREQUEST Request, IOCTL_VALIDAT
 			WdfRequestComplete(Request, STATUS_NOT_SUPPORTED);
 			return STATUS_NOT_SUPPORTED;
 		}
+		if (ptr->mem_type >= FRAME_MEM_MAX) {
+			ERR("Unknown/invalid frame memory type: %u\n", ptr->mem_type);
+			WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+			return STATUS_INVALID_PARAMETER;
+		}
 		break;
 	}
 	case VALIDATE_CURSOR: {

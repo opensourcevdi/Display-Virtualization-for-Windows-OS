@@ -409,6 +409,7 @@ static NTSTATUS IoctlRequestSetMode(const PDEVICE_CONTEXT DeviceContext, const s
 	tempCurrentMode.DispInfo.ColorFormat = ColorFormatToD3DDDIFmt(ptr->color_format);
 	tempCurrentMode.FrameBuffer.Ptr = (BYTE *)ptr->addr;
 	tempCurrentMode.Stride = ptr->stride;
+	tempCurrentMode.DeviceMemory = (ptr->mem_type == FRAME_MEM_DEVICE);
 	// Mark this as a mode set so SetCurrentModeExt can drop any stale flush
 	// back-pressure left over from a previous swapchain instance.
 	tempCurrentMode.SetMode = TRUE;
@@ -418,6 +419,13 @@ static NTSTATUS IoctlRequestSetMode(const PDEVICE_CONTEXT DeviceContext, const s
 		ERR("SetCurrentModeExt failed with status = %d\n", status);
 		WdfRequestComplete(Request, STATUS_UNSUCCESSFUL);
 		return STATUS_UNSUCCESSFUL;
+	}
+
+	// A device memory frame buffer already holds the current frame (the UMD
+	// copies it on the GPU before SET_MODE), and clearing it through the CPU
+	// would mean writing the whole surface over the BAR. Skip the blackout.
+	if (ptr->mem_type == FRAME_MEM_DEVICE) {
+		return STATUS_SUCCESS;
 	}
 
 	// BlackOutScreen
@@ -531,8 +539,9 @@ static NTSTATUS IoctlRequestPresentFb(const PDEVICE_CONTEXT DeviceContext, const
 		return status;
 	}
 
-	status = pAdapter->ExecutePresentDisplayZeroCopy((BYTE *)ptr->addr, ptr->bitrate, ptr->pitch, ptr->width,
-													 ptr->height, ptr->screen_num, ptr->stride);
+	status =
+		pAdapter->ExecutePresentDisplayZeroCopy((BYTE *)ptr->addr, ptr->bitrate, ptr->pitch, ptr->width, ptr->height,
+												ptr->screen_num, ptr->stride, (ptr->mem_type == FRAME_MEM_DEVICE));
 
 	if (status != STATUS_SUCCESS) {
 		ERR("ExecutePresentDisplayZeroCopy failed with status = %d\n", status);

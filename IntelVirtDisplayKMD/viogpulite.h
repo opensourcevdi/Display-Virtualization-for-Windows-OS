@@ -75,6 +75,10 @@ typedef struct _CURRENT_MODE
 	// outstanding flush back-pressure from the previous swapchain is stale.
 	BOOLEAN SetMode;
 
+	// FrameBuffer.Ptr maps device local memory of the render GPU (the VF memory
+	// BAR) instead of guest RAM. See FRAME_MEM_DEVICE.
+	BOOLEAN DeviceMemory;
+
 	PHYSICAL_ADDRESS ZeroedOutStart;
 	PHYSICAL_ADDRESS ZeroedOutEnd;
 
@@ -119,6 +123,8 @@ public:
 	KEVENT m_DisplayInfoEvent;
 	KEVENT m_EdidEvent;
 	KEVENT m_FlushEvent;
+	// Completion of a synchronous SET_SCANOUT_BLOB, see CreateFrameBufferObj().
+	KEVENT m_ScanoutEvent;
 	VioGpuMemSegment m_FrameSegment;
 	// important must be alligned to because of InterlockedExchangePointer usage
 	VioGpuObj *m_pFrameBuf[FRAMEBUFFER_COUNT];
@@ -132,6 +138,8 @@ public:
 	// Stride/pitch the persistent Front resource and scanout-blob were configured
 	// with; a change requires recreate to avoid host reading with stale layout.
 	UINT m_FbStride;
+	// Whether the persistent Front resource is backed by device local memory.
+	BOOLEAN m_FbDeviceMem;
 	VioGpuObj *m_pCursorBuf;
 	VioGpuMemSegment m_CursorSegment;
 	BOOL m_FlushCount;
@@ -215,7 +223,7 @@ public:
 	NTSTATUS HWClose(void);
 	NTSTATUS ExecutePresentDisplayZeroCopy(_In_ BYTE *SrcAddr, _In_ UINT SrcBytesPerPixel, _In_ LONG SrcPitch,
 										   _In_ UINT SrcWidth, _In_ UINT SrcHeight, _In_ UINT ScreenNum,
-										   _In_ UINT Stride);
+										   _In_ UINT Stride, _In_ BOOLEAN DeviceMemory);
 	VOID BlackOutScreen(CURRENT_MODE *pCurrentMod);
 	BOOLEAN InterruptRoutine(_In_ ULONG MessageNumber);
 	VOID DpcRoutine(void);

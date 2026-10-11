@@ -407,8 +407,11 @@ void CtrlQueue::SetScanout(UINT scan_id, UINT res_id, UINT width, UINT height, U
 	QueueBuffer(vbuf);
 }
 
-void CtrlQueue::SetScanoutBlob(UINT scan_id, UINT res_id, UINT width, UINT height, UINT format, UINT x, UINT y,
-							   UINT stride)
+// With an event the call waits for the host's answer and returns whether the
+// scanout was accepted. The event must stay valid after a timeout, as the DPC
+// still signals it once the host completes the command.
+BOOLEAN CtrlQueue::SetScanoutBlob(UINT scan_id, UINT res_id, UINT width, UINT height, UINT format, UINT x, UINT y,
+								  UINT stride, KEVENT *event)
 {
 	PAGED_CODE();
 	TRACING();
@@ -418,7 +421,7 @@ void CtrlQueue::SetScanoutBlob(UINT scan_id, UINT res_id, UINT width, UINT heigh
 	cmd = (PGPU_SET_SCANOUT_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
 	if ((vbuf == NULL) || (cmd == NULL)) {
 		ERR("Couldn't allocate %ld bytes of memory\n", sizeof(*cmd));
-		return;
+		return FALSE;
 	}
 	RtlZeroMemory(cmd, sizeof(*cmd));
 
@@ -440,9 +443,34 @@ void CtrlQueue::SetScanoutBlob(UINT scan_id, UINT res_id, UINT width, UINT heigh
 	cmd->r.x = x;
 	cmd->r.y = y;
 
-	// FIXME if
-	DBGPRINT("QueueBuffer, type = %d, screen = %d\n", cmd->hdr.type, scan_id);
+	if (event == NULL) {
+		// FIXME if
+		DBGPRINT("QueueBuffer, type = %d, screen = %d\n", cmd->hdr.type, scan_id);
+		QueueBuffer(vbuf);
+		return TRUE;
+	}
+
+	KeInitializeEvent(event, NotificationEvent, FALSE);
+	vbuf->event = event;
+
+	DBGPRINT("QueueBuffer (sync), type = %d, screen = %d\n", cmd->hdr.type, scan_id);
 	QueueBuffer(vbuf);
+
+	LARGE_INTEGER timeout = {0};
+	timeout.QuadPart = Int32x32To64(1000, -10000);
+	if (KeWaitForSingleObject(event, Executive, KernelMode, FALSE, &timeout) == STATUS_TIMEOUT) {
+		// The device still owns vbuf, so it cannot be released here.
+		ERR("Timeout waiting for SET_SCANOUT_BLOB response, screen = %d\n", scan_id);
+		return FALSE;
+	}
+
+	ULONG respType = ((PGPU_CTRL_HDR)vbuf->resp_buf)->type;
+	ReleaseBuffer(vbuf);
+	if (respType != VIRTIO_GPU_RESP_OK_NODATA) {
+		ERR("SET_SCANOUT_BLOB rejected by host, screen = %d, resp = 0x%x\n", scan_id, respType);
+		return FALSE;
+	}
+	return TRUE;
 }
 
 void CtrlQueue::ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y, UINT screen_num, KEVENT *event)
@@ -826,6 +854,8 @@ VioGpuMemSegment::VioGpuMemSegment(void)
 	m_bSystemMemory = FALSE;
 	m_bUserMemory = FALSE;
 	m_bMapped = FALSE;
+	m_bDeviceMemory = FALSE;
+	m_uVerifyCursor = 0;
 	m_Size = 0;
 }
 
@@ -922,7 +952,135 @@ BOOLEAN VioGpuMemSegment::Init(_In_ UINT size, _In_ PPHYSICAL_ADDRESS pPAddr)
 	return TRUE;
 }
 
-BOOLEAN VioGpuMemSegment::InitExt(_In_ UINT size, _In_ PVOID pUserAddr)
+// Returns TRUE if pa lies inside one of the guest system RAM ranges.
+static BOOLEAN IsSystemRamAddress(_In_ PPHYSICAL_MEMORY_RANGE pRanges, _In_ PHYSICAL_ADDRESS pa)
+{
+	for (; pRanges->BaseAddress.QuadPart != 0 || pRanges->NumberOfBytes.QuadPart != 0; pRanges++) {
+		if (pa.QuadPart >= pRanges->BaseAddress.QuadPart &&
+			pa.QuadPart - pRanges->BaseAddress.QuadPart < pRanges->NumberOfBytes.QuadPart) {
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+BOOLEAN VioGpuMemSegment::InitDeviceMemory(_In_ UINT size, _In_ PVOID pUserAddr)
+{
+	PAGED_CODE();
+	TRACING();
+
+	UINT pages = BYTES_TO_PAGES(size);
+	UINT sglsize = sizeof(SCATTER_GATHER_LIST) + (sizeof(SCATTER_GATHER_ELEMENT) * pages);
+	size = pages * PAGE_SIZE;
+
+	// The buffer is a user mapping of the render GPU's device local memory
+	// (D3D12 GPU upload heap through the VF memory BAR). Such pages have no PFN
+	// database entry, so MmProbeAndLockPages() cannot pin them and the VA may
+	// not even be lockable. Resolve the guest physical addresses directly;
+	// QEMU maps them back to the VFIO BAR and exports a VFIO dmabuf.
+	//
+	// Since nothing is locked, only accept addresses outside guest RAM. A RAM
+	// page that is not locked could be freed and reused while the host still
+	// scans it out.
+	PPHYSICAL_MEMORY_RANGE pRamRanges = MmGetPhysicalMemoryRanges();
+	if (pRamRanges == NULL) {
+		ERR("MmGetPhysicalMemoryRanges failed\n");
+		return FALSE;
+	}
+
+	m_pSGList = reinterpret_cast<PSCATTER_GATHER_LIST>(new (NonPagedPoolNx) BYTE[sglsize]);
+	if (m_pSGList == NULL) {
+		ERR("Insufficient resources to allocate SGList\n");
+		ExFreePool(pRamRanges);
+		return FALSE;
+	}
+	RtlZeroMemory(m_pSGList, sglsize);
+
+	BOOLEAN ok = TRUE;
+	__try {
+		ProbeForRead(pUserAddr, size, sizeof(BYTE));
+		PUCHAR buf = (PUCHAR)PAGE_ALIGN(pUserAddr);
+		for (UINT i = 0; i < pages; ++i) {
+			PHYSICAL_ADDRESS pa = MmGetPhysicalAddress(buf);
+			if (pa.QuadPart == 0LL) {
+				ERR("Device memory page %d at %p is not mapped\n", i, buf);
+				ok = FALSE;
+				break;
+			}
+			if (IsSystemRamAddress(pRamRanges, pa)) {
+				ERR("Device memory page %d at %p resolves to system RAM (0x%I64x)\n", i, buf, pa.QuadPart);
+				ok = FALSE;
+				break;
+			}
+			m_pSGList->Elements[i].Address = pa;
+			m_pSGList->Elements[i].Length = PAGE_SIZE;
+			m_pSGList->NumberOfElements++;
+			buf += PAGE_SIZE;
+		}
+	}
+#pragma prefast(                                                                                                       \
+	suppress : __WARNING_EXCEPTIONEXECUTEHANDLER,                                                                      \
+	"try/except is only able to protect against user-mode errors and these are the only errors we try to catch here");
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		ERR("Invalid device memory buffer, exception %x\n", GetExceptionCode());
+		ok = FALSE;
+	}
+	ExFreePool(pRamRanges);
+
+	if (!ok) {
+		delete[] reinterpret_cast<PBYTE>(m_pSGList);
+		m_pSGList = NULL;
+		return FALSE;
+	}
+
+	DBGPRINT("Device memory frame buffer %p, %d pages, first page at 0x%I64x\n", pUserAddr, pages,
+			 m_pSGList->Elements[0].Address.QuadPart);
+	m_pVAddr = pUserAddr;
+	m_bUserMemory = TRUE;
+	m_bDeviceMemory = TRUE;
+	m_uVerifyCursor = 0;
+	m_Size = size;
+	return TRUE;
+}
+
+// Number of pages re-resolved per call of IsDeviceBackingStable(), on top of
+// the first and last page. A 4K frame is fully covered in about two seconds.
+#define DEVICE_BACKING_VERIFY_PAGES 64
+
+BOOLEAN VioGpuMemSegment::IsDeviceBackingStable(void)
+{
+	PAGED_CODE();
+
+	if (!m_bDeviceMemory || m_pSGList == NULL || m_pSGList->NumberOfElements == 0) {
+		return TRUE;
+	}
+
+	// Must run in the context of the process owning the mapping (the UMD's
+	// IOCTL). Checks a rotating window so every page is eventually revisited
+	// without walking the whole frame on every present.
+	UINT count = m_pSGList->NumberOfElements;
+	PUCHAR base = (PUCHAR)PAGE_ALIGN(m_pVAddr);
+	UINT check[DEVICE_BACKING_VERIFY_PAGES + 2];
+	UINT n = 0;
+	check[n++] = 0;
+	check[n++] = count - 1;
+	for (UINT i = 0; i < DEVICE_BACKING_VERIFY_PAGES && i < count; i++) {
+		check[n++] = (m_uVerifyCursor + i) % count;
+	}
+	m_uVerifyCursor = (m_uVerifyCursor + DEVICE_BACKING_VERIFY_PAGES) % count;
+
+	for (UINT i = 0; i < n; i++) {
+		PHYSICAL_ADDRESS pa = MmGetPhysicalAddress(base + (SIZE_T)check[i] * PAGE_SIZE);
+		if (pa.QuadPart != m_pSGList->Elements[check[i]].Address.QuadPart) {
+			ERR("Device memory page %d moved from 0x%I64x to 0x%I64x\n", check[i],
+				m_pSGList->Elements[check[i]].Address.QuadPart, pa.QuadPart);
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+BOOLEAN VioGpuMemSegment::InitExt(_In_ UINT size, _In_ PVOID pUserAddr, _In_ BOOLEAN bDeviceMemory)
 {
 	PAGED_CODE();
 	TRACING();
@@ -935,6 +1093,10 @@ BOOLEAN VioGpuMemSegment::InitExt(_In_ UINT size, _In_ PVOID pUserAddr)
 	UINT pages = BYTES_TO_PAGES(size);
 	UINT sglsize = sizeof(SCATTER_GATHER_LIST) + (sizeof(SCATTER_GATHER_ELEMENT) * pages);
 	size = pages * PAGE_SIZE;
+
+	if (size > 0 && pUserAddr != NULL && bDeviceMemory) {
+		return InitDeviceMemory(size, pUserAddr);
+	}
 
 	if (size > 0 && pUserAddr != NULL) {
 		m_pVAddr = pUserAddr;
@@ -1036,6 +1198,8 @@ void VioGpuMemSegment::Close(void)
 	m_bSystemMemory = FALSE;
 	m_bUserMemory = FALSE;
 	m_bMapped = FALSE;
+	m_bDeviceMemory = FALSE;
+	m_uVerifyCursor = 0;
 	m_Size = 0;
 
 	if (m_pSGList) {

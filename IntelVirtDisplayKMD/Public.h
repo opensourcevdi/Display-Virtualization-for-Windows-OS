@@ -48,6 +48,20 @@ typedef enum color_format
 	FRAME_TYPE_MAX,	   // sentinel value
 } color_format;
 
+// Where the frame buffer passed in FrameMetaData::addr lives.
+typedef enum frame_mem_type
+{
+	// Guest system RAM (D3D11 staging texture). The KMD locks the pages and the
+	// host imports them via udmabuf.
+	FRAME_MEM_SYSTEM,
+	// CPU-visible device local memory of the render GPU (D3D12 GPU upload heap
+	// mapped through the VF memory BAR). The guest physical addresses fall into
+	// a VFIO BAR on the host, which QEMU exports as a VFIO dmabuf, so the frame
+	// never leaves GPU memory.
+	FRAME_MEM_DEVICE,
+	FRAME_MEM_MAX, // sentinel value
+} frame_mem_type;
+
 typedef struct FrameMetaData
 {
 	unsigned int width;
@@ -59,6 +73,7 @@ typedef struct FrameMetaData
 	void *addr;
 	unsigned short refresh_rate;
 	unsigned int screen_num;
+	unsigned int mem_type; // frame_mem_type
 
 } FrameMetaData;
 

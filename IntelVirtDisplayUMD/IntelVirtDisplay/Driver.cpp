@@ -60,6 +60,27 @@ static struct monitor_identity g_monitor_identity[MAX_SCAN_OUT] = {};
 
 BOOL hwcursorsupported = TRUE;
 
+// Device local memory scanout (see D3D12FrameCopier). Set for the lifetime of
+// the driver once the render GPU, the KMD or the host rejected a device memory
+// frame buffer, or after repeated GPU copy failures; all swapchains then use
+// the system memory staging path.
+static volatile LONG g_device_mem_disabled = FALSE;
+static volatile LONG g_device_mem_failures = 0;
+#define DEVICE_MEM_MAX_FAILURES 3
+
+// HKLM\SOFTWARE\IntelVirtDisplay, DWORD DeviceMemoryScanout: 0 disables the
+// device memory path. Enabled when the value is absent.
+static BOOL device_mem_scanout_enabled()
+{
+	DWORD value = 1;
+	DWORD size = sizeof(value);
+	if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\IntelVirtDisplay", L"DeviceMemoryScanout", RRF_RT_REG_DWORD, NULL,
+					 &value, &size) != ERROR_SUCCESS) {
+		return TRUE;
+	}
+	return value != 0;
+}
+
 #pragma region SampleMonitors
 
 DWORD intelvirtdisplay_monitor_count = 1;
@@ -650,19 +671,11 @@ void SwapChainProcessor::cleanup_resources()
 	TRACING();
 
 	// Do this before anything else is torn down.
-	if (m_staging_addr_valid && g_DevInfo != NULL && g_DevInfo->get_Handle() != INVALID_HANDLE_VALUE) {
-		UINT32 screen = (UINT32)m_screen_num;
-		struct KMDF_IOCTL_Response resp = {0};
-		ULONG respSize = 0;
-		if (!DeviceIoControl(g_DevInfo->get_Handle(), IOCTL_INTELVIRTDISPLAY_RELEASE_FB, &screen, sizeof(screen), &resp,
-							 sizeof(resp), &respSize, NULL)) {
-			ERR("IOCTL_INTELVIRTDISPLAY_RELEASE_FB failed (screen %d), error %lu\n", m_screen_num, GetLastError());
-		} else {
-			DBGPRINT("Released KMD framebuffer for screen %d before unmapping staging buffer\n", m_screen_num);
-		}
-	}
-	m_staging_addr_valid = FALSE;
-	m_last_reported_addr = NULL;
+	release_kmd_framebuffer();
+
+	// Only now that the KMD no longer references it.
+	m_d3d12_copier.reset();
+	m_use_device_mem = FALSE;
 
 	// ****** Frame Resources ******
 	if (m_framedata != NULL) {
@@ -749,6 +762,7 @@ void SwapChainProcessor::init()
 	m_staging_mapped = FALSE;
 	m_last_reported_addr = NULL;
 	m_staging_addr_valid = FALSE;
+	m_use_device_mem = FALSE;
 	m_GPUResourceMutex = NULL;
 	m_cursorthread_handle = NULL;
 	m_ioctlresp_cursor = NULL;
@@ -929,6 +943,118 @@ void SwapChainProcessor::RunCore()
  *
  * Description
  *
+ * release_kmd_framebuffer - Tells IntelVirtDisplayKMD to detach the host from
+ * the frame buffer published for this screen and to drop its scanout resource.
+ * Must be called before that buffer is freed or replaced.
+ *
+ ******************************************************************************/
+void SwapChainProcessor::release_kmd_framebuffer()
+{
+	if (m_staging_addr_valid && g_DevInfo != NULL && g_DevInfo->get_Handle() != INVALID_HANDLE_VALUE) {
+		UINT32 screen = (UINT32)m_screen_num;
+		struct KMDF_IOCTL_Response resp = {0};
+		ULONG respSize = 0;
+		if (!DeviceIoControl(g_DevInfo->get_Handle(), IOCTL_INTELVIRTDISPLAY_RELEASE_FB, &screen, sizeof(screen), &resp,
+							 sizeof(resp), &respSize, NULL)) {
+			ERR("IOCTL_INTELVIRTDISPLAY_RELEASE_FB failed (screen %d), error %lu\n", m_screen_num, GetLastError());
+		} else {
+			DBGPRINT("Released KMD framebuffer for screen %d before freeing the frame buffer\n", m_screen_num);
+		}
+	}
+	m_staging_addr_valid = FALSE;
+	m_last_reported_addr = NULL;
+}
+
+/*******************************************************************************
+ *
+ * Description
+ *
+ * setup_device_mem_target - Prepares the device local memory frame buffer for
+ * the current mode (m_input_desc). Frames are copied on the GPU into a D3D12
+ * GPU upload heap buffer; its guest physical addresses lie in the render GPU's
+ * memory BAR, which QEMU exports as a VFIO dmabuf.
+ *
+ * Return val
+ * TRUE if the device memory path is used, FALSE to use the staging texture
+ *
+ ******************************************************************************/
+BOOL SwapChainProcessor::setup_device_mem_target()
+{
+	HRESULT hr;
+
+	// Unlike the staging pages, device memory is not locked by the KMD, so it
+	// has to stop referencing the previous buffer before it is replaced.
+	if (m_d3d12_copier) {
+		release_kmd_framebuffer();
+		m_d3d12_copier->ReleaseTarget();
+	}
+
+	// 10bpc frames are rejected by the KMD; let them fail on the staging path
+	// rather than disabling device memory for the 8bpc swapchains that follow.
+	if (g_device_mem_disabled || m_format == FRAME_TYPE_RGBA10 || !device_mem_scanout_enabled()) {
+		ERR("screen %d: device memory scanout not used (disabled after earlier failure = %d, 10bpc = %d, registry "
+			"DeviceMemoryScanout = %d)\n",
+			m_screen_num, (int)g_device_mem_disabled, m_format == FRAME_TYPE_RGBA10, device_mem_scanout_enabled());
+		m_d3d12_copier.reset();
+		return FALSE;
+	}
+
+	if (!m_d3d12_copier) {
+		std::unique_ptr<D3D12FrameCopier> copier(new (std::nothrow) D3D12FrameCopier());
+		if (!copier) {
+			ERR("Failed allocating the D3D12 frame copier\n");
+			return FALSE;
+		}
+		hr = copier->Init(m_Device->Adapter.Get(), m_Device->Device.Get(), m_Device->DeviceContext.Get());
+		if (FAILED(hr)) {
+			ERR("Device memory scanout not available on this GPU (0x%08X)\n", hr);
+			disable_device_mem(TRUE);
+			return FALSE;
+		}
+		m_d3d12_copier = std::move(copier);
+	}
+
+	hr = m_d3d12_copier->Resize(m_input_desc.Width, m_input_desc.Height, m_input_desc.Format);
+	if (FAILED(hr)) {
+		ERR("Failed creating the device memory frame buffer (0x%08X)\n", hr);
+		disable_device_mem(FALSE);
+		return FALSE;
+	}
+
+	DBGPRINT("screen %d: using device memory frame buffer %p pitch %u\n", m_screen_num, m_d3d12_copier->GetData(),
+			 m_d3d12_copier->GetRowPitch());
+	return TRUE;
+}
+
+/*******************************************************************************
+ *
+ * Description
+ *
+ * disable_device_mem - Leaves the device memory path for this swapchain. With
+ * permanently set, or after repeated failures, also for all later swapchains.
+ * The next frame sets up the staging texture.
+ *
+ ******************************************************************************/
+void SwapChainProcessor::disable_device_mem(BOOL permanently)
+{
+	if (permanently || InterlockedIncrement(&g_device_mem_failures) >= DEVICE_MEM_MAX_FAILURES) {
+		if (!InterlockedExchange(&g_device_mem_disabled, TRUE)) {
+			ERR("Device memory scanout disabled, falling back to system memory staging\n");
+		}
+	}
+
+	if (m_d3d12_copier) {
+		release_kmd_framebuffer();
+		m_d3d12_copier.reset();
+	}
+	m_use_device_mem = FALSE;
+	m_resolution_changed = TRUE;
+}
+
+/*******************************************************************************
+ *
+ * Description
+ *
  * GetFrameData - This function configures the frame metadata and gets the
  * frame from GPU.It passes the frame to IntelVirtDisplayKMD using IOCTL call :
  * set_mode and frame_data
@@ -955,7 +1081,7 @@ int SwapChainProcessor::GetFrameData(std::shared_ptr<Direct3DDevice> intelvirtdi
 	}
 
 	if (m_resolution_changed == TRUE) {
-		DBGPRINT("ResolutionChanged, setting up new staging buffer\n");
+		DBGPRINT("ResolutionChanged, setting up new frame buffer\n");
 
 		// Drop the previous staging buffer and its long-lived mapping before
 		// building the replacement.
@@ -992,6 +1118,12 @@ int SwapChainProcessor::GetFrameData(std::shared_ptr<Direct3DDevice> intelvirtdi
 			break;
 		}
 
+		// Prefer copying into device local memory; the staging texture below is
+		// the fallback.
+		m_use_device_mem = setup_device_mem_target();
+	}
+
+	if (m_resolution_changed == TRUE && !m_use_device_mem) {
 		/* Configure the staging descriptor  */
 		m_staging_desc.Width = m_input_desc.Width;
 		m_staging_desc.Height = m_input_desc.Height;
@@ -1023,28 +1155,51 @@ int SwapChainProcessor::GetFrameData(std::shared_ptr<Direct3DDevice> intelvirtdi
 		}
 	}
 
+	void *frame_addr = NULL;
+	UINT frame_pitch = 0;
+
 	WaitForSingleObject(m_GPUResourceMutex, INFINITE);
 
-	// CopyResource requires the destination to be unmapped. Drop the persistent
-	// mapping for the duration of the copy, then re-establish it below.
-	if (m_staging_mapped) {
-		intelvirtdisplay_device->DeviceContext->Unmap(m_destimage, 0);
-		m_staging_mapped = FALSE;
-	}
-
-	intelvirtdisplay_device->DeviceContext->CopyResource((ID3D11Resource *)m_destimage, (ID3D11Resource *)desktopimage);
-	desktopimage->Release();
-	status =
-		intelvirtdisplay_device->DeviceContext->Map((ID3D11Resource *)m_destimage, 0, D3D11_MAP_READ, 0, &m_staging_buffer);
-	if (FAILED(status)) {
-		ERR("Failed to Map the resource intelvirtdisplay_device->DeviceContext->Map (0x%08X)\n", status);
-		m_destimage->Release();
-		m_destimage = NULL;
+	if (m_use_device_mem) {
+		// GPU copy straight into device local memory. Nothing is read back by
+		// the CPU; the KMD only translates the mapping to guest physical
+		// addresses for the host.
+		HRESULT hr = m_d3d12_copier->Copy(desktopimage);
+		desktopimage->Release();
 		ReleaseMutex(m_GPUResourceMutex);
-		return INTELVIRTDISPLAYUMD_FAILURE;
+		if (FAILED(hr)) {
+			ERR("Device memory frame copy failed (0x%08X), screen = %d\n", hr, m_screen_num);
+			disable_device_mem(FALSE);
+			return INTELVIRTDISPLAYUMD_FAILURE;
+		}
+		InterlockedExchange(&g_device_mem_failures, 0);
+		frame_addr = m_d3d12_copier->GetData();
+		frame_pitch = m_d3d12_copier->GetRowPitch();
+	} else {
+		// CopyResource requires the destination to be unmapped. Drop the persistent
+		// mapping for the duration of the copy, then re-establish it below.
+		if (m_staging_mapped) {
+			intelvirtdisplay_device->DeviceContext->Unmap(m_destimage, 0);
+			m_staging_mapped = FALSE;
+		}
+
+		intelvirtdisplay_device->DeviceContext->CopyResource((ID3D11Resource *)m_destimage,
+															 (ID3D11Resource *)desktopimage);
+		desktopimage->Release();
+		status = intelvirtdisplay_device->DeviceContext->Map((ID3D11Resource *)m_destimage, 0, D3D11_MAP_READ, 0,
+															 &m_staging_buffer);
+		if (FAILED(status)) {
+			ERR("Failed to Map the resource intelvirtdisplay_device->DeviceContext->Map (0x%08X)\n", status);
+			m_destimage->Release();
+			m_destimage = NULL;
+			ReleaseMutex(m_GPUResourceMutex);
+			return INTELVIRTDISPLAYUMD_FAILURE;
+		}
+		m_staging_mapped = TRUE;
+		ReleaseMutex(m_GPUResourceMutex);
+		frame_addr = (void *)m_staging_buffer.pData;
+		frame_pitch = m_staging_buffer.RowPitch;
 	}
-	m_staging_mapped = TRUE;
-	ReleaseMutex(m_GPUResourceMutex);
 
 	// The KMD builds a persistent virtio-gpu scanout resource over these guest
 	// pages and only rebuilds it when the reported address/geometry changes. If
@@ -1057,14 +1212,14 @@ int SwapChainProcessor::GetFrameData(std::shared_ptr<Direct3DDevice> intelvirtdi
 	// that garbage produced a bogus "mapping moved" report on the very first
 	// frame of every swapchain. Gate on m_staging_addr_valid instead, which is
 	// only set once we have genuinely published an address to the KMD.
-	if (m_staging_addr_valid && m_last_reported_addr != (void *)m_staging_buffer.pData) {
-		DBGPRINT("Staging mapping moved (%p -> %p), forcing KMD resource rebuild\n", m_last_reported_addr,
-				 m_staging_buffer.pData);
+	if (m_staging_addr_valid && m_last_reported_addr != frame_addr) {
+		DBGPRINT("Frame buffer mapping moved (%p -> %p), forcing KMD resource rebuild\n", m_last_reported_addr,
+				 frame_addr);
 		m_resolution_changed = TRUE;
 	}
 
-	m_pitch = m_staging_buffer.RowPitch;
-	m_stride = m_staging_buffer.RowPitch / 4;
+	m_pitch = frame_pitch;
+	m_stride = frame_pitch / 4;
 	m_framedata->width = m_width;
 	m_framedata->height = m_height;
 	m_framedata->color_format = m_format;
@@ -1072,8 +1227,8 @@ int SwapChainProcessor::GetFrameData(std::shared_ptr<Direct3DDevice> intelvirtdi
 	m_framedata->stride = m_stride;
 	m_framedata->bitrate = INTELVIRTDISPLAY_BBP;
 	m_framedata->screen_num = m_screen_num;
-	// Assigning the m_staging_buffer buffer addr
-	m_framedata->addr = (void *)m_staging_buffer.pData;
+	m_framedata->addr = frame_addr;
+	m_framedata->mem_type = m_use_device_mem ? FRAME_MEM_DEVICE : FRAME_MEM_SYSTEM;
 
 	if (!(print_counter++ % PRINT_FREQ)) {
 		DBGPRINT("m_framedata->width = %d\n", m_framedata->width);
@@ -1084,6 +1239,7 @@ int SwapChainProcessor::GetFrameData(std::shared_ptr<Direct3DDevice> intelvirtdi
 		DBGPRINT("m_framedata->bitrate = %d\n", m_framedata->bitrate);
 		DBGPRINT("m_framedata->screen_num = %d\n", m_framedata->screen_num);
 		DBGPRINT("m_framedata->addr = %p\n", m_framedata->addr);
+		DBGPRINT("m_framedata->mem_type = %d\n", m_framedata->mem_type);
 	}
 
 	if (m_resolution_changed == TRUE) {
@@ -1095,6 +1251,12 @@ int SwapChainProcessor::GetFrameData(std::shared_ptr<Direct3DDevice> intelvirtdi
 			FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, GetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
 						   err, 255, NULL);
 			ERR("IOCTL_INTELVIRTDISPLAY_SET_MODE call failed with error: %s!\n", err);
+			if (m_use_device_mem) {
+				// The KMD or the host could not use the device memory buffer
+				// (e.g. QEMU without VFIO dmabuf support). The restarted
+				// swapchain uses system memory.
+				disable_device_mem(TRUE);
+			}
 			return INTELVIRTDISPLAYUMD_FAILURE;
 		}
 		m_resolution_changed = FALSE;
@@ -1106,12 +1268,15 @@ int SwapChainProcessor::GetFrameData(std::shared_ptr<Direct3DDevice> intelvirtdi
 		FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, GetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), err,
 					   255, NULL);
 		ERR("IOCTL_INTELVIRTDISPLAY_FRAME_DATA call failed with error: %s!\n", err);
+		if (m_use_device_mem) {
+			disable_device_mem(TRUE);
+		}
 		return INTELVIRTDISPLAYUMD_FAILURE;
 	}
 
 	// Only now has the KMD actually been told about this address, so this is the
 	// correct point to record it for the next frame's move-detection.
-	m_last_reported_addr = (void *)m_staging_buffer.pData;
+	m_last_reported_addr = frame_addr;
 	m_staging_addr_valid = TRUE;
 
 	// The staging resource stays mapped between frames. The KMD has locked these
