@@ -60,10 +60,47 @@ D3D12FrameCopier::~D3D12FrameCopier()
 	}
 }
 
+// Raises the GPU scheduling priority of the whole driver process: the D3D12
+// copy queue isn't covered by IddCxSetRealtimeGPUPriority (D3D11 device only),
+// and global realtime queue priority is refused (DXGI_ERROR_ACCESS_DENIED), so
+// with a focused full-screen load (FurMark) the copy lost (~40 frames/s, 74
+// unfocused). Tries realtime, then high; logged. Once per process. Loaded from
+// gdi32.dll at runtime (D3DKMTSetProcessSchedulingPriorityClass, d3dkmthk.h).
+static void raise_process_gpu_priority()
+{
+	static LONG done = 0;
+	if (InterlockedExchange(&done, 1)) {
+		return;
+	}
+	typedef LONG(APIENTRY * SetPriorityClassFn)(HANDLE, INT);
+	HMODULE gdi = LoadLibraryExW(L"gdi32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+	SetPriorityClassFn set =
+		gdi ? reinterpret_cast<SetPriorityClassFn>(GetProcAddress(gdi, "D3DKMTSetProcessSchedulingPriorityClass"))
+			: NULL;
+	if (set == NULL) {
+		ERR("D3DKMTSetProcessSchedulingPriorityClass not available\n");
+		return;
+	}
+	// D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME = 5, _HIGH = 4 (NTSTATUS 0 = success).
+	LONG status = set(GetCurrentProcess(), 5);
+	if (status == 0) {
+		ERR("GPU process priority: realtime\n");
+		return;
+	}
+	LONG high = set(GetCurrentProcess(), 4);
+	if (high == 0) {
+		ERR("GPU process priority: realtime refused (0x%08X), high\n", status);
+	} else {
+		ERR("GPU process priority: realtime refused (0x%08X), high refused (0x%08X)\n", status, high);
+	}
+}
+
 HRESULT D3D12FrameCopier::Init(IDXGIAdapter1 *adapter, ID3D11Device *d3d11Device, ID3D11DeviceContext *d3d11Context)
 {
 	TRACING();
 	HRESULT hr;
+
+	raise_process_gpu_priority();
 
 	// Loaded at runtime so the driver still starts where D3D12 is unavailable;
 	// the caller then stays on the system memory staging path.
@@ -96,22 +133,42 @@ HRESULT D3D12FrameCopier::Init(IDXGIAdapter1 *adapter, ID3D11Device *d3d11Device
 		return E_NOTIMPL;
 	}
 
+	// A copy queue: on Intel GPUs it runs on the copy engine (blitter), not
+	// the 3D engine, so the frame copy doesn't queue up behind a game or
+	// benchmark keeping the 3D engine busy (FurMark: ~17 frames/s with a
+	// direct queue; test). CopyTextureRegion, the fences and the implicit
+	// promotion of COMMON resources to COPY_SOURCE/COPY_DEST work on copy
+	// queues as well.
+	const D3D12_COMMAND_LIST_TYPE listType = D3D12_COMMAND_LIST_TYPE_COPY;
+	// Global realtime priority, the D3D12 counterpart of
+	// IddCxSetRealtimeGPUPriority (which only takes the D3D11 device): with
+	// HIGH the copy lost against a focused full-screen load (FurMark: ~40
+	// frames/s, 74 with FurMark unfocused). It may need a privilege the
+	// driver's process doesn't have; then fall back to HIGH. Logged either
+	// way so the log shows which one the frames get.
 	D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-	queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-	queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+	queueDesc.Type = listType;
+	queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME;
 	hr = m_device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_queue));
-	if (FAILED(hr)) {
-		ERR("CreateCommandQueue failed (0x%08X)\n", hr);
-		return hr;
+	if (SUCCEEDED(hr)) {
+		ERR("D3D12 copy queue: global realtime priority\n");
+	} else {
+		ERR("D3D12 copy queue: global realtime priority refused (0x%08X), using high\n", hr);
+		queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+		hr = m_device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_queue));
+		if (FAILED(hr)) {
+			ERR("CreateCommandQueue failed (0x%08X)\n", hr);
+			return hr;
+		}
 	}
 
-	hr = m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_allocator));
+	hr = m_device->CreateCommandAllocator(listType, IID_PPV_ARGS(&m_allocator));
 	if (FAILED(hr)) {
 		ERR("CreateCommandAllocator failed (0x%08X)\n", hr);
 		return hr;
 	}
 
-	hr = m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_allocator.Get(), nullptr,
+	hr = m_device->CreateCommandList(0, listType, m_allocator.Get(), nullptr,
 									 IID_PPV_ARGS(&m_list));
 	if (FAILED(hr)) {
 		ERR("CreateCommandList failed (0x%08X)\n", hr);
