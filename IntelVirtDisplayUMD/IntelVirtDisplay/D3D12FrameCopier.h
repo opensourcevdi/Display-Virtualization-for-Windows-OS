@@ -31,20 +31,24 @@ public:
 	// the IddCx D3D11 device. Fails if GPU upload heaps are not available.
 	HRESULT Init(IDXGIAdapter1 *adapter, ID3D11Device *d3d11Device, ID3D11DeviceContext *d3d11Context);
 
-	// (Re)creates the persistently mapped target buffer for surfaces of the
+	// Frame buffers the swapchain rotates through: one on screen, one being
+	// presented to the host, one to copy the next frame into.
+	static constexpr UINT TARGET_COUNT = 3;
+
+	// (Re)creates the persistently mapped target buffers for surfaces of the
 	// given size/format. Drops all cached surfaces.
 	HRESULT Resize(UINT width, UINT height, DXGI_FORMAT format);
 
-	// Copies the surface into the target buffer and waits until the copy has
-	// completed. The caller must hold the lock serialising the D3D11 immediate
-	// context, as a signal is queued on it.
-	HRESULT Copy(ID3D11Texture2D *surface);
+	// Copies the surface into target buffer `target` and waits until the copy
+	// has completed. The caller must hold the lock serialising the D3D11
+	// immediate context, as a signal is queued on it.
+	HRESULT Copy(ID3D11Texture2D *surface, UINT target);
 
-	// Releases the target buffer and all cached surfaces. The caller must make
-	// sure the KMD no longer references the buffer.
+	// Releases the target buffers and all cached surfaces. The caller must make
+	// sure the KMD no longer references them.
 	void ReleaseTarget();
 
-	void *GetData() const { return m_data; }
+	void *GetData(UINT target) const { return target < TARGET_COUNT ? m_data[target] : NULL; }
 	UINT GetRowPitch() const { return m_rowPitch; }
 
 private:
@@ -80,9 +84,9 @@ private:
 	UINT64 m_copyValue;
 	HANDLE m_copyEvent;
 
-	Microsoft::WRL::ComPtr<ID3D12Resource> m_target;
+	Microsoft::WRL::ComPtr<ID3D12Resource> m_target[TARGET_COUNT];
 	D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_footprint;
-	void *m_data;
+	void *m_data[TARGET_COUNT];
 	UINT m_rowPitch;
 
 	CachedSurface m_surfaces[SURFACE_CACHE_SIZE];

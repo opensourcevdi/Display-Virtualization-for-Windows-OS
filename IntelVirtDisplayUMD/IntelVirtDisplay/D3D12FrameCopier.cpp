@@ -25,7 +25,7 @@ using Microsoft::WRL::ComPtr;
 #define TARGET_ALIGNMENT (64 * 1024)
 
 D3D12FrameCopier::D3D12FrameCopier()
-	: m_d3d12Module(NULL), m_interopValue(0), m_copyValue(0), m_copyEvent(NULL), m_footprint{}, m_data(NULL),
+	: m_d3d12Module(NULL), m_interopValue(0), m_copyValue(0), m_copyEvent(NULL), m_footprint{}, m_data{},
 	  m_rowPitch(0), m_nextSurface(0)
 {}
 
@@ -270,35 +270,39 @@ HRESULT D3D12FrameCopier::Resize(UINT width, UINT height, DXGI_FORMAT format)
 	bufDesc.SampleDesc.Count = 1;
 	bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-	hr = m_device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &bufDesc, D3D12_RESOURCE_STATE_COMMON,
-										   nullptr, IID_PPV_ARGS(&m_target));
-	if (FAILED(hr)) {
-		ERR("Creating the %I64u byte GPU upload buffer failed (0x%08X)\n", size, hr);
-		return hr;
-	}
-
-	// The KMD does not pin device memory, it only notices a relocation after
-	// the fact. Ask the memory manager to keep this allocation in place.
 	ComPtr<ID3D12Device1> device1;
-	if (SUCCEEDED(m_device.As(&device1))) {
-		ID3D12Pageable *pageable = m_target.Get();
-		D3D12_RESIDENCY_PRIORITY priority = D3D12_RESIDENCY_PRIORITY_MAXIMUM;
-		device1->SetResidencyPriority(1, &pageable, &priority);
-	}
+	m_device.As(&device1);
+	for (UINT i = 0; i < TARGET_COUNT; i++) {
+		hr = m_device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
+											   D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&m_target[i]));
+		if (FAILED(hr)) {
+			ERR("Creating GPU upload buffer %u (%I64u bytes) failed (0x%08X)\n", i, size, hr);
+			ReleaseTarget();
+			return hr;
+		}
 
-	// Persistent mapping; the CPU never reads it, the VA is only translated to
-	// guest physical addresses by the KMD.
-	D3D12_RANGE noRead = {0, 0};
-	hr = m_target->Map(0, &noRead, &m_data);
-	if (FAILED(hr)) {
-		ERR("Mapping the GPU upload buffer failed (0x%08X)\n", hr);
-		m_target.Reset();
-		m_data = NULL;
-		return hr;
+		// The KMD does not pin device memory, it only notices a relocation
+		// after the fact. Ask the memory manager to keep it in place.
+		if (device1) {
+			ID3D12Pageable *pageable = m_target[i].Get();
+			D3D12_RESIDENCY_PRIORITY priority = D3D12_RESIDENCY_PRIORITY_MAXIMUM;
+			device1->SetResidencyPriority(1, &pageable, &priority);
+		}
+
+		// Persistent mapping; the CPU never reads it, the VA is only
+		// translated to guest physical addresses by the KMD.
+		D3D12_RANGE noRead = {0, 0};
+		hr = m_target[i]->Map(0, &noRead, &m_data[i]);
+		if (FAILED(hr)) {
+			ERR("Mapping GPU upload buffer %u failed (0x%08X)\n", i, hr);
+			m_data[i] = NULL;
+			ReleaseTarget();
+			return hr;
+		}
+		DBGPRINT("GPU upload buffer %u: %ux%u size %I64u mapped at %p\n", i, width, height, size, m_data[i]);
 	}
 
 	m_rowPitch = m_footprint.Footprint.RowPitch;
-	DBGPRINT("GPU upload buffer %ux%u pitch %u size %I64u mapped at %p\n", width, height, m_rowPitch, size, m_data);
 	return S_OK;
 }
 
@@ -312,13 +316,15 @@ void D3D12FrameCopier::ReleaseTarget()
 	}
 	m_nextSurface = 0;
 
-	if (m_target) {
-		if (m_data) {
-			m_target->Unmap(0, nullptr);
+	for (UINT i = 0; i < TARGET_COUNT; i++) {
+		if (m_target[i]) {
+			if (m_data[i]) {
+				m_target[i]->Unmap(0, nullptr);
+			}
+			m_target[i].Reset();
 		}
-		m_target.Reset();
+		m_data[i] = NULL;
 	}
-	m_data = NULL;
 	m_rowPitch = 0;
 	m_footprint = {};
 }
@@ -367,11 +373,11 @@ HRESULT D3D12FrameCopier::OpenSurface(ID3D11Texture2D *surface, ID3D12Resource *
 	return opened.CopyTo(resource);
 }
 
-HRESULT D3D12FrameCopier::Copy(ID3D11Texture2D *surface)
+HRESULT D3D12FrameCopier::Copy(ID3D11Texture2D *surface, UINT target)
 {
 	HRESULT hr;
 
-	if (!m_target || !m_data) {
+	if (target >= TARGET_COUNT || !m_target[target] || !m_data[target]) {
 		return E_NOT_VALID_STATE;
 	}
 
@@ -421,7 +427,7 @@ HRESULT D3D12FrameCopier::Copy(ID3D11Texture2D *surface)
 	// promoted to COPY_SOURCE and the buffer to COPY_DEST, and both decay back
 	// once the list has executed, so no barriers are needed.
 	D3D12_TEXTURE_COPY_LOCATION dst = {};
-	dst.pResource = m_target.Get();
+	dst.pResource = m_target[target].Get();
 	dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
 	dst.PlacedFootprint = m_footprint;
 

@@ -763,6 +763,14 @@ void SwapChainProcessor::init()
 	m_last_reported_addr = NULL;
 	m_staging_addr_valid = FALSE;
 	m_use_device_mem = FALSE;
+	InitializeSRWLock(&m_present_lock);
+	InitializeConditionVariable(&m_present_cv);
+	m_ready = m_presenting = m_scanout = NO_BUFFER;
+	m_mode_pending = FALSE;
+	m_present_stop = FALSE;
+	m_present_failed = FALSE;
+	m_present_thread = NULL;
+	SecureZeroMemory(&m_present_meta, sizeof(m_present_meta));
 	m_GPUResourceMutex = NULL;
 	m_cursorthread_handle = NULL;
 	m_ioctlresp_cursor = NULL;
@@ -950,6 +958,9 @@ void SwapChainProcessor::RunCore()
  ******************************************************************************/
 void SwapChainProcessor::release_kmd_framebuffer()
 {
+	// The present thread must not hand the KMD a buffer that is going away.
+	stop_presenting();
+
 	if (m_staging_addr_valid && g_DevInfo != NULL && g_DevInfo->get_Handle() != INVALID_HANDLE_VALUE) {
 		UINT32 screen = (UINT32)m_screen_num;
 		struct KMDF_IOCTL_Response resp = {0};
@@ -963,6 +974,174 @@ void SwapChainProcessor::release_kmd_framebuffer()
 	}
 	m_staging_addr_valid = FALSE;
 	m_last_reported_addr = NULL;
+}
+
+/*******************************************************************************
+ *
+ * Description
+ *
+ * start_presenting - (Re)starts the present thread for the device memory path
+ * with all frame buffers free; the first present sends SET_MODE.
+ *
+ * The frame thread copies each frame into a buffer that is neither on screen
+ * nor being presented (take_write_buffer) and releases the IddCx frame at once.
+ * The present thread hands the latest copied buffer to the KMD, which switches
+ * the scanout to that buffer's persistent resource and flushes it, waiting for
+ * the host. The buffer on screen is not written until another one replaces it:
+ * the host may answer a flush before it has finished reading the frame, and
+ * only reads it again after the next flush, which needs the next present.
+ *
+ ******************************************************************************/
+void SwapChainProcessor::start_presenting()
+{
+	stop_presenting();
+
+	AcquireSRWLockExclusive(&m_present_lock);
+	m_ready = m_presenting = m_scanout = NO_BUFFER;
+	m_mode_pending = TRUE;
+	m_present_stop = FALSE;
+	m_present_failed = FALSE;
+	ReleaseSRWLockExclusive(&m_present_lock);
+
+	m_present_thread = CreateThread(nullptr, 0, PresentThread, this, 0, nullptr);
+	if (m_present_thread == NULL) {
+		ERR("screen %d: creating the present thread failed (%lu)\n", m_screen_num, GetLastError());
+		AcquireSRWLockExclusive(&m_present_lock);
+		m_present_failed = TRUE;
+		ReleaseSRWLockExclusive(&m_present_lock);
+	}
+}
+
+/*******************************************************************************
+ *
+ * Description
+ *
+ * stop_presenting - Stops the present thread and waits for it; a present in
+ * progress completes first. No-op if it isn't running.
+ *
+ ******************************************************************************/
+void SwapChainProcessor::stop_presenting()
+{
+	if (m_present_thread == NULL) {
+		return;
+	}
+	AcquireSRWLockExclusive(&m_present_lock);
+	m_present_stop = TRUE;
+	ReleaseSRWLockExclusive(&m_present_lock);
+	WakeAllConditionVariable(&m_present_cv);
+	WaitForSingleObject(m_present_thread, INFINITE);
+	CloseHandle(m_present_thread);
+	m_present_thread = NULL;
+}
+
+/*******************************************************************************
+ *
+ * Description
+ *
+ * take_write_buffer - A frame buffer to copy the next frame into: a free one,
+ * else the one ready but not yet presented (its frame is superseded). Never
+ * the one on screen or the one being presented.
+ *
+ * Return val
+ * int - buffer index, NO_BUFFER if none
+ *
+ ******************************************************************************/
+int SwapChainProcessor::take_write_buffer()
+{
+	int target = NO_BUFFER;
+	AcquireSRWLockExclusive(&m_present_lock);
+	for (int i = 0; i < (int)D3D12FrameCopier::TARGET_COUNT; i++) {
+		if (i != m_scanout && i != m_presenting && i != m_ready) {
+			target = i;
+			break;
+		}
+	}
+	if (target == NO_BUFFER && m_ready != NO_BUFFER) {
+		target = m_ready;
+		m_ready = NO_BUFFER;
+	}
+	ReleaseSRWLockExclusive(&m_present_lock);
+	return target;
+}
+
+DWORD CALLBACK SwapChainProcessor::PresentThread(LPVOID Argument)
+{
+	// Same scheduling class as the frame thread (see Run()).
+	DWORD AvTask = 0;
+	HANDLE AvTaskHandle = AvSetMmThreadCharacteristicsW(L"Distribution", &AvTask);
+	reinterpret_cast<SwapChainProcessor *>(Argument)->present_loop();
+	if (AvTaskHandle) {
+		AvRevertMmThreadCharacteristics(AvTaskHandle);
+	}
+	return 0;
+}
+
+/*******************************************************************************
+ *
+ * Description
+ *
+ * present_loop - Hands the latest copied frame buffer to the KMD until stopped
+ * or an IOCTL fails (then the frame thread falls back to system memory).
+ *
+ ******************************************************************************/
+void SwapChainProcessor::present_loop()
+{
+	char err[256];
+	for (;;) {
+		AcquireSRWLockExclusive(&m_present_lock);
+		while (!m_present_stop && m_ready == NO_BUFFER) {
+			SleepConditionVariableSRW(&m_present_cv, &m_present_lock, INFINITE, 0);
+		}
+		if (m_present_stop) {
+			ReleaseSRWLockExclusive(&m_present_lock);
+			break;
+		}
+		int buffer = m_ready;
+		m_ready = NO_BUFFER;
+		m_presenting = buffer;
+		BOOL set_mode = m_mode_pending;
+		m_mode_pending = FALSE;
+		struct FrameMetaData meta = m_present_meta;
+		ReleaseSRWLockExclusive(&m_present_lock);
+
+		meta.addr = m_d3d12_copier->GetData((UINT)buffer);
+		struct KMDF_IOCTL_Response resp = {0};
+		ULONG respSize = 0;
+		BOOL ok = TRUE;
+		if (set_mode) {
+			ok = DeviceIoControl(g_DevInfo->get_Handle(), IOCTL_INTELVIRTDISPLAY_SET_MODE, &meta, sizeof(meta), &resp,
+								 sizeof(resp), &respSize, NULL);
+			if (!ok) {
+				FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, GetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+							   err, 255, NULL);
+				ERR("IOCTL_INTELVIRTDISPLAY_SET_MODE call failed with error: %s!\n", err);
+			}
+		}
+		if (ok) {
+			ok = DeviceIoControl(g_DevInfo->get_Handle(), IOCTL_INTELVIRTDISPLAY_FRAME_DATA, &meta, sizeof(meta), &resp,
+								 sizeof(resp), &respSize, NULL);
+			if (!ok) {
+				FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, GetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+							   err, 255, NULL);
+				ERR("IOCTL_INTELVIRTDISPLAY_FRAME_DATA call failed with error: %s!\n", err);
+			}
+		}
+
+		AcquireSRWLockExclusive(&m_present_lock);
+		m_presenting = NO_BUFFER;
+		if (ok) {
+			m_scanout = buffer;
+			// The KMD now references the buffers; release_kmd_framebuffer()
+			// detaches them before they go away.
+			m_staging_addr_valid = TRUE;
+		} else {
+			m_present_failed = TRUE;
+		}
+		ReleaseSRWLockExclusive(&m_present_lock);
+		if (!ok) {
+			break;
+		}
+	}
 }
 
 /*******************************************************************************
@@ -1021,7 +1200,7 @@ BOOL SwapChainProcessor::setup_device_mem_target()
 		return FALSE;
 	}
 
-	DBGPRINT("screen %d: using device memory frame buffer %p pitch %u\n", m_screen_num, m_d3d12_copier->GetData(),
+	DBGPRINT("screen %d: using device memory frame buffers at %p pitch %u\n", m_screen_num, m_d3d12_copier->GetData(0),
 			 m_d3d12_copier->GetRowPitch());
 	return TRUE;
 }
@@ -1158,13 +1337,53 @@ int SwapChainProcessor::GetFrameData(std::shared_ptr<Direct3DDevice> intelvirtdi
 	void *frame_addr = NULL;
 	UINT frame_pitch = 0;
 
-	WaitForSingleObject(m_GPUResourceMutex, INFINITE);
-
 	if (m_use_device_mem) {
+		// Pipelined: copy into a free frame buffer and hand it to the present
+		// thread; the IddCx frame is released right after this returns,
+		// without waiting for the KMD and the host. See start_presenting().
+		if (m_resolution_changed == TRUE) {
+			m_pitch = m_d3d12_copier->GetRowPitch();
+			m_stride = m_pitch / 4;
+			SecureZeroMemory(&m_present_meta, sizeof(m_present_meta));
+			m_present_meta.width = m_width;
+			m_present_meta.height = m_height;
+			m_present_meta.color_format = m_format;
+			m_present_meta.pitch = m_pitch;
+			m_present_meta.stride = m_stride;
+			m_present_meta.bitrate = INTELVIRTDISPLAY_BBP;
+			m_present_meta.screen_num = m_screen_num;
+			m_present_meta.mem_type = FRAME_MEM_DEVICE;
+			start_presenting();
+			m_resolution_changed = FALSE;
+		}
+
+		BOOL failed;
+		AcquireSRWLockExclusive(&m_present_lock);
+		failed = m_present_failed;
+		ReleaseSRWLockExclusive(&m_present_lock);
+		if (failed) {
+			// The KMD or the host refused the device memory buffer (e.g. QEMU
+			// without VFIO dmabuf support): the restarted swapchain uses
+			// system memory.
+			desktopimage->Release();
+			disable_device_mem(TRUE);
+			return INTELVIRTDISPLAYUMD_FAILURE;
+		}
+
+		int target = take_write_buffer();
+		if (target == NO_BUFFER) {
+			// Can't happen with three buffers; drop the frame rather than
+			// write into one the host may be reading.
+			ERR("screen %d: no free frame buffer, frame dropped\n", m_screen_num);
+			desktopimage->Release();
+			return INTELVIRTDISPLAYUMD_SUCCESS;
+		}
+
 		// GPU copy straight into device local memory. Nothing is read back by
 		// the CPU; the KMD only translates the mapping to guest physical
 		// addresses for the host.
-		HRESULT hr = m_d3d12_copier->Copy(desktopimage);
+		WaitForSingleObject(m_GPUResourceMutex, INFINITE);
+		HRESULT hr = m_d3d12_copier->Copy(desktopimage, (UINT)target);
 		desktopimage->Release();
 		ReleaseMutex(m_GPUResourceMutex);
 		if (FAILED(hr)) {
@@ -1173,9 +1392,17 @@ int SwapChainProcessor::GetFrameData(std::shared_ptr<Direct3DDevice> intelvirtdi
 			return INTELVIRTDISPLAYUMD_FAILURE;
 		}
 		InterlockedExchange(&g_device_mem_failures, 0);
-		frame_addr = m_d3d12_copier->GetData();
-		frame_pitch = m_d3d12_copier->GetRowPitch();
-	} else {
+
+		AcquireSRWLockExclusive(&m_present_lock);
+		m_ready = target;
+		ReleaseSRWLockExclusive(&m_present_lock);
+		WakeConditionVariable(&m_present_cv);
+		return INTELVIRTDISPLAYUMD_SUCCESS;
+	}
+
+	WaitForSingleObject(m_GPUResourceMutex, INFINITE);
+
+	{
 		// CopyResource requires the destination to be unmapped. Drop the persistent
 		// mapping for the duration of the copy, then re-establish it below.
 		if (m_staging_mapped) {

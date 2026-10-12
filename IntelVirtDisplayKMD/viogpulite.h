@@ -96,12 +96,6 @@ typedef struct _POINTER_SHAPE
 	DXGKARG_SETPOINTERSHAPE pointer;
 } POINTER_SHAPE;
 
-enum class FrameBufSlot : UINT
-{
-	Front = 0,
-	Back = 1,
-};
-
 // Number of consecutive frames that may be dropped due to an outstanding flush
 // before the KMD assumes the host completion was lost and force-recovers. At
 // ~60fps this is roughly a second of frozen output, long enough to never trip
@@ -111,7 +105,12 @@ enum class FrameBufSlot : UINT
 class ScreenInfo
 {
 public:
-	static constexpr size_t FRAMEBUFFER_COUNT = 2;
+	// Scanout resources per screen. The UMD's device memory path rotates
+	// through three frame buffers (one on screen, one being presented, one
+	// being written); each gets its own persistent resource here, so
+	// switching between them is a SET_SCANOUT_BLOB, not a new host import.
+	// The system memory staging path only ever uses one.
+	static constexpr size_t FRAMEBUFFER_COUNT = 3;
 	PVIDEO_MODE_INFORMATION m_ModeInfo;
 	ULONG m_ModeCount;
 	PUSHORT m_ModeNumbers;
@@ -125,21 +124,28 @@ public:
 	KEVENT m_FlushEvent;
 	// Completion of a synchronous SET_SCANOUT_BLOB, see CreateFrameBufferObj().
 	KEVENT m_ScanoutEvent;
+	// Backing of slot 0 (also the kernel's own frame buffer at init, see
+	// HWInit); slots 1.. use m_ExtraSegments. Use Segment(slot).
 	VioGpuMemSegment m_FrameSegment;
+	VioGpuMemSegment m_ExtraSegments[FRAMEBUFFER_COUNT - 1];
 	// important must be alligned to because of InterlockedExchangePointer usage
 	VioGpuObj *m_pFrameBuf[FRAMEBUFFER_COUNT];
-	// Guest backing pointer the persistent Front resource was built from;
-	// used to detect when the scanout resource must be recreated.
-	PVOID m_FbSrcAddr;
-	// Dimensions the persistent Front resource was built for; a resolution
-	// change must force a recreate even when m_FbSrcAddr is unchanged.
-	UINT m_FbWidth;
-	UINT m_FbHeight;
-	// Stride/pitch the persistent Front resource and scanout-blob were configured
-	// with; a change requires recreate to avoid host reading with stale layout.
-	UINT m_FbStride;
-	// Whether the persistent Front resource is backed by device local memory.
-	BOOLEAN m_FbDeviceMem;
+	// What each slot's persistent resource was built from: the guest backing
+	// pointer, dimensions, stride and memory type. A frame whose identity
+	// matches a slot reuses its resource; anything else replaces a slot.
+	struct FbIdentity
+	{
+		PVOID addr;
+		UINT width;
+		UINT height;
+		UINT stride;
+		BOOLEAN deviceMem;
+		// Order of last use, to replace the least recently used slot.
+		ULONG lastUse;
+	} m_Fb[FRAMEBUFFER_COUNT];
+	// The slot currently set as the scanout (-1: none).
+	INT m_ScanoutSlot;
+	ULONG m_UseCounter;
 	VioGpuObj *m_pCursorBuf;
 	VioGpuMemSegment m_CursorSegment;
 	BOOL m_FlushCount;
@@ -156,17 +162,19 @@ public:
 	ULONG GetModeCount(void) { return m_ModeCount; }
 	USHORT GetModeNumber(USHORT idx) { return m_ModeNumbers[idx]; }
 	USHORT GetCurrentModeIndex(void) { return m_CurrentMode; }
-	VioGpuObj *GetFrameBufferObj(FrameBufSlot buf);
-	UINT GetFrameBufferIndex(FrameBufSlot bufSlot);
-	void SetFrameBufferObj(VioGpuObj *buf, FrameBufSlot bufType);
-	void SwapFramebuffer();
+	VioGpuMemSegment &Segment(UINT slot) { return slot == 0 ? m_FrameSegment : m_ExtraSegments[slot - 1]; }
+	// The resource on screen, NULL if none.
+	VioGpuObj *GetScanoutObj() { return m_ScanoutSlot >= 0 ? m_pFrameBuf[m_ScanoutSlot] : NULL; }
+	// Slot whose resource was built for this frame buffer, -1 if none.
+	INT FindSlot(PVOID addr, UINT width, UINT height, UINT stride, BOOLEAN deviceMem);
+	// Slot to build a new resource in: an empty one, else the least recently
+	// used one that isn't on screen.
+	UINT PickSlot();
+	void ForgetSlot(UINT slot);
 	void SetCurrentModeIndex(USHORT idx) { m_CurrentMode = idx; }
 	void SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres);
 	void SetVideoModeInfo(UINT Idx, PGPU_DISP_MODE_EXT pModeInfo);
 	void Reset();
-
-private:
-	UINT m_FrontBufferIndex;
 };
 
 class IVioGpuAdapterLite
@@ -238,8 +246,12 @@ public:
 	UINT32 GetNumScreens() { return m_u32NumScanouts; }
 	UINT32 GetModeListSize(UINT32 screen_num) { return m_screen[screen_num].mode_list.modelist_size; }
 	VOID CopyResolution(UINT32 screen_num, struct edid_info *edata);
-	PVOID GetFbVAddr(UINT32 screen_num) { return m_screen[screen_num].m_FrameSegment.GetFbVAddr(); }
-	VOID Close(UINT32 screen_num) { m_screen[screen_num].m_FrameSegment.Close(); }
+	// Backing of the resource on screen (slot 0 if none yet).
+	PVOID GetFbVAddr(UINT32 screen_num)
+	{
+		INT slot = m_screen[screen_num].m_ScanoutSlot;
+		return m_screen[screen_num].Segment(slot >= 0 ? (UINT)slot : 0).GetFbVAddr();
+	}
 	PBYTE GetEdidData(UINT Idx);
 	VOID FillPresentStatus(struct hp_info *info);
 	VOID SetEvent(HANDLE event);
@@ -256,9 +268,9 @@ private:
 	void ProcessEdid(UINT32 screen_num);
 	BOOLEAN GetEdids(UINT32 screen_num);
 	void AddEdidModes(UINT32 screen_num);
-	void CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, FrameBufSlot bufType, CURRENT_MODE *pCurrentMode);
-	void FlushFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURRENT_MODE *pCurrentMode);
-	void DestroyFrameBufferSlotObj(UINT32 screen_num, FrameBufSlot bufSlot, BOOLEAN bReset);
+	void CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, UINT slot, CURRENT_MODE *pCurrentMode);
+	void FlushFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, UINT slot, CURRENT_MODE *pCurrentMode);
+	void DestroyFrameBufferSlotObj(UINT32 screen_num, UINT slot, BOOLEAN bReset);
 	void DestroyFrameBufferObj(VioGpuObj **ppFbuf, BOOLEAN bReset);
 	BOOLEAN CreateCursor(_In_ CONST POINTER_SHAPE *pSetPointerShape, _In_ CONST UINT cf);
 	void DestroyCursor(UINT32 screen_num);

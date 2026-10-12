@@ -67,12 +67,9 @@ ScreenInfo::ScreenInfo(void)
 	for (size_t i = 0; i < FRAMEBUFFER_COUNT; ++i) {
 		m_pFrameBuf[i] = NULL;
 	}
-	m_FrontBufferIndex = 0;
-	m_FbSrcAddr = NULL;
-	m_FbWidth = 0;
-	m_FbHeight = 0;
-	m_FbStride = 0;
-	m_FbDeviceMem = FALSE;
+	RtlZeroMemory(m_Fb, sizeof(m_Fb));
+	m_ScanoutSlot = -1;
+	m_UseCounter = 0;
 	m_pCursorBuf = NULL;
 	m_FlushCount = 0;
 	m_FlushStallCount = 0;
@@ -111,20 +108,41 @@ void ScreenInfo::Reset()
 	RtlZeroMemory(&gpu_disp_mode_ext, sizeof(GPU_DISP_MODE_EXT) * MAX_MODELIST_SIZE);
 }
 
-void ScreenInfo::SwapFramebuffer() { m_FrontBufferIndex = (m_FrontBufferIndex + 1) % FRAMEBUFFER_COUNT; }
-
-UINT ScreenInfo::GetFrameBufferIndex(FrameBufSlot bufSlot)
+INT ScreenInfo::FindSlot(PVOID addr, UINT width, UINT height, UINT stride, BOOLEAN deviceMem)
 {
-	return (m_FrontBufferIndex + (UINT)bufSlot) % FRAMEBUFFER_COUNT;
+	for (UINT i = 0; i < FRAMEBUFFER_COUNT; i++) {
+		const FbIdentity &fb = m_Fb[i];
+		if (m_pFrameBuf[i] != NULL && fb.addr == addr && fb.width == width && fb.height == height &&
+			fb.stride == stride && fb.deviceMem == deviceMem) {
+			return (INT)i;
+		}
+	}
+	return -1;
 }
 
-VioGpuObj *ScreenInfo::GetFrameBufferObj(FrameBufSlot bufSlot) { return m_pFrameBuf[GetFrameBufferIndex(bufSlot)]; }
-
-void ScreenInfo::SetFrameBufferObj(VioGpuObj *buf, FrameBufSlot bufSlot)
+UINT ScreenInfo::PickSlot()
 {
-	ASSERT(buf != NULL);
-	m_pFrameBuf[GetFrameBufferIndex(bufSlot)] = buf;
-};
+	for (UINT i = 0; i < FRAMEBUFFER_COUNT; i++) {
+		if (m_pFrameBuf[i] == NULL) {
+			return i;
+		}
+	}
+	UINT victim = (m_ScanoutSlot == 0) ? 1 : 0;
+	for (UINT i = 0; i < FRAMEBUFFER_COUNT; i++) {
+		if ((INT)i != m_ScanoutSlot && m_Fb[i].lastUse < m_Fb[victim].lastUse) {
+			victim = i;
+		}
+	}
+	return victim;
+}
+
+void ScreenInfo::ForgetSlot(UINT slot)
+{
+	RtlZeroMemory(&m_Fb[slot], sizeof(m_Fb[slot]));
+	if (m_ScanoutSlot == (INT)slot) {
+		m_ScanoutSlot = -1;
+	}
+}
 
 VioGpuAdapterLite::VioGpuAdapterLite(_In_ PVOID pvDeviceContext) : IVioGpuAdapterLite(pvDeviceContext)
 {
@@ -218,6 +236,9 @@ NTSTATUS VioGpuAdapterLite::SetCurrentModeExt(CURRENT_MODE *pCurrentMode)
 			scr.m_FlushStallCount = 0;
 		}
 
+		// Set by the flush-stall recovery below: rebuild the frame's resource
+		// even if one matches, so the host re-imports the backing.
+		BOOLEAN forceRebuild = FALSE;
 		if (scr.m_FlushCount) {
 			// A flush is still outstanding with QEMU. Skip this frame to keep
 			// the original back-pressure and avoid overwriting a buffer the
@@ -238,9 +259,7 @@ NTSTATUS VioGpuAdapterLite::SetCurrentModeExt(CURRENT_MODE *pCurrentMode)
 				ERR("screen %d: flush stalled for %d frames, forcing recovery\n", targetId, scr.m_FlushStallCount);
 				scr.m_FlushCount = 0;
 				scr.m_FlushStallCount = 0;
-				// Force a full rebuild on this pass so the host re-imports the
-				// backing rather than continuing to scan out a stale mapping.
-				scr.m_FbSrcAddr = NULL;
+				forceRebuild = TRUE;
 			} else {
 				break;
 			}
@@ -248,54 +267,62 @@ NTSTATUS VioGpuAdapterLite::SetCurrentModeExt(CURRENT_MODE *pCurrentMode)
 			scr.m_FlushStallCount = 0;
 		}
 
-		VioGpuObj *front = scr.GetFrameBufferObj(FrameBufSlot::Front);
-
-		// Reuse a single persistent scanout resource across frames. The UMD
-		// funnels every present through one staging buffer, so the guest
-		// backing pages are identical frame to frame; reusing the resource
-		// avoids the per-frame host dmabuf re-import that triggered
-		// wbinvd_on_all_cpus() and the audio jitter.
+		// One persistent scanout resource per frame buffer, reused across
+		// frames: rebuilding it per frame would mean a host dmabuf re-import
+		// every frame, which triggered wbinvd_on_all_cpus() and audio jitter.
+		// The system memory staging path presents one buffer (one slot); the
+		// device memory path rotates through three, and switching between
+		// their resources is only a SET_SCANOUT_BLOB.
 		//
-		// Recreate when the backing actually changes: first present, a new
-		// staging address, a new stride, or a resolution change. The backing
-		// pointer alone is not sufficient -- on a mode switch the allocator can
-		// hand back the same VA, so dimensions/stride must also be checked.
-		BOOLEAN backingChanged =
-			(front == NULL) || (scr.m_FbSrcAddr != pCurrentMode->FrameBuffer.Ptr) ||
-			(scr.m_FbWidth != pCurrentMode->DispInfo.Width) || (scr.m_FbHeight != pCurrentMode->DispInfo.Height) ||
-			(scr.m_FbStride != pCurrentMode->Stride) || (scr.m_FbDeviceMem != pCurrentMode->DeviceMemory);
+		// A frame matches a slot by backing pointer, dimensions, stride and
+		// memory type: on a mode switch the allocator can hand back the same
+		// VA, so the pointer alone is not sufficient.
+		INT slot = scr.FindSlot(pCurrentMode->FrameBuffer.Ptr, pCurrentMode->DispInfo.Width,
+								pCurrentMode->DispInfo.Height, pCurrentMode->Stride, pCurrentMode->DeviceMemory);
 
 		// Device local memory is not locked (there is no PFN to lock), so the
 		// GPU memory manager may relocate the allocation behind the same VA.
 		// The host would then keep scanning out the old VRAM range, so rebuild
 		// the resource whenever the physical backing moved.
-		if (!backingChanged && pCurrentMode->DeviceMemory && !scr.m_FrameSegment.IsDeviceBackingStable()) {
-			ERR("screen %d: device memory backing moved, rebuilding scanout resource\n", targetId);
-			backingChanged = TRUE;
+		if (slot >= 0 && pCurrentMode->DeviceMemory && !scr.Segment((UINT)slot).IsDeviceBackingStable()) {
+			ERR("screen %d: device memory backing of slot %d moved, rebuilding its scanout resource\n", targetId, slot);
+			forceRebuild = TRUE;
 		}
 
-		if (backingChanged) {
-			if (front != NULL) {
-				DestroyFrameBufferSlotObj(targetId, FrameBufSlot::Front, FALSE);
+		if (slot < 0 || forceRebuild) {
+			UINT target = (slot >= 0) ? (UINT)slot : scr.PickSlot();
+			if (scr.m_pFrameBuf[target] != NULL) {
+				if (scr.m_ScanoutSlot == (INT)target) {
+					// Point the host away before its backing goes.
+					m_CtrlQueue.SetScanout(targetId, 0, 0, 0, 0, 0);
+				}
+				DestroyFrameBufferSlotObj(targetId, target, FALSE);
 			}
-			scr.m_FbSrcAddr = pCurrentMode->FrameBuffer.Ptr;
-			scr.m_FbWidth = pCurrentMode->DispInfo.Width;
-			scr.m_FbHeight = pCurrentMode->DispInfo.Height;
-			scr.m_FbStride = pCurrentMode->Stride;
-			scr.m_FbDeviceMem = pCurrentMode->DeviceMemory;
-			CreateFrameBufferObj(&scr.m_ModeInfo[idx], FrameBufSlot::Front, pCurrentMode);
-			if (pCurrentMode->DeviceMemory && scr.GetFrameBufferObj(FrameBufSlot::Front) == NULL) {
-				// Tell the UMD so it can fall back to a system memory staging
-				// buffer instead of presenting into a resource that does not exist.
-				ERR("screen %d: device memory framebuffer rejected\n", targetId);
-				scr.m_FbSrcAddr = NULL;
-				status = STATUS_NOT_SUPPORTED;
+			scr.ForgetSlot(target);
+			CreateFrameBufferObj(&scr.m_ModeInfo[idx], target, pCurrentMode);
+			if (scr.m_pFrameBuf[target] == NULL) {
+				if (pCurrentMode->DeviceMemory) {
+					// Tell the UMD so it can fall back to a system memory staging
+					// buffer instead of presenting into a resource that does not exist.
+					ERR("screen %d: device memory framebuffer rejected\n", targetId);
+					status = STATUS_NOT_SUPPORTED;
+				}
 				break;
 			}
-			DBGPRINT("screen %d: created persistent framebuffer (%d x %d) stride=%d\n", targetId,
+			ScreenInfo::FbIdentity &fb = scr.m_Fb[target];
+			fb.addr = pCurrentMode->FrameBuffer.Ptr;
+			fb.width = pCurrentMode->DispInfo.Width;
+			fb.height = pCurrentMode->DispInfo.Height;
+			fb.stride = pCurrentMode->Stride;
+			fb.deviceMem = pCurrentMode->DeviceMemory;
+			fb.lastUse = ++scr.m_UseCounter;
+			// CreateFrameBufferObj set it as the scanout and flushed it.
+			scr.m_ScanoutSlot = (INT)target;
+			DBGPRINT("screen %d: created persistent framebuffer in slot %u (%d x %d) stride=%d\n", targetId, target,
 					 scr.m_ModeInfo[idx].VisScreenWidth, scr.m_ModeInfo[idx].VisScreenHeight, pCurrentMode->Stride);
 		} else {
-			FlushFrameBufferObj(&scr.m_ModeInfo[idx], pCurrentMode);
+			FlushFrameBufferObj(&scr.m_ModeInfo[idx], (UINT)slot, pCurrentMode);
+			scr.m_Fb[slot].lastUse = ++scr.m_UseCounter;
 		}
 		break;
 	}
@@ -321,25 +348,24 @@ NTSTATUS VioGpuAdapterLite::ReleaseFrameBuffer(UINT32 screen_num)
 
 	ScreenInfo &scr = m_screen[screen_num];
 
-	DBGPRINT("screen %u: releasing persistent framebuffer (UMD staging buffer going away)\n", screen_num);
+	DBGPRINT("screen %u: releasing persistent framebuffers (UMD frame buffers going away)\n", screen_num);
 
 	// Point the host at nothing before the backing disappears, so it cannot keep
 	// scanning out pages the UMD is about to hand back to D3D11.
 	m_CtrlQueue.SetScanout(screen_num, 0, 0, 0, 0, 0);
 
-	if (scr.GetFrameBufferObj(FrameBufSlot::Front) != NULL) {
-		DestroyFrameBufferSlotObj(screen_num, FrameBufSlot::Front, FALSE);
+	for (UINT slot = 0; slot < ScreenInfo::FRAMEBUFFER_COUNT; slot++) {
+		if (scr.m_pFrameBuf[slot] != NULL) {
+			DestroyFrameBufferSlotObj(screen_num, slot, FALSE);
+		}
+		// Unlock/free the MDL built over the UMD's staging pages (or forget
+		// the device memory pages).
+		if (scr.Segment(slot).GetFbVAddr()) {
+			scr.Segment(slot).Close();
+		}
+		// Forget the cached identity so the next present rebuilds from scratch.
+		scr.ForgetSlot(slot);
 	}
-
-	// Unlock/free the MDL built over the UMD's staging pages.
-	scr.m_FrameSegment.Close();
-
-	// Forget the cached identity so the next present rebuilds from scratch.
-	scr.m_FbSrcAddr = NULL;
-	scr.m_FbWidth = 0;
-	scr.m_FbHeight = 0;
-	scr.m_FbStride = 0;
-	scr.m_FbDeviceMem = FALSE;
 
 	// Any flush still outstanding refers to the resource just destroyed; its
 	// completion will never be matched, so clear the back-pressure.
@@ -664,8 +690,10 @@ NTSTATUS VioGpuAdapterLite::HWClose(void)
 		m_pWorkThread = NULL;
 	}
 	for (UINT32 i = 0; i < m_u32NumScanouts; i++) {
-		if (m_screen[i].m_FrameSegment.GetFbVAddr()) {
-			m_screen[i].m_FrameSegment.Close();
+		for (UINT slot = 0; slot < ScreenInfo::FRAMEBUFFER_COUNT; slot++) {
+			if (m_screen[i].Segment(slot).GetFbVAddr()) {
+				m_screen[i].Segment(slot).Close();
+			}
 		}
 		if (m_screen[i].m_CursorSegment.GetFbVAddr()) {
 			m_screen[i].m_CursorSegment.Close();
@@ -766,7 +794,7 @@ VOID VioGpuAdapterLite::BlackOutScreen(CURRENT_MODE *pCurrentMod)
 
 		KeWaitForMutexObject(&m_screen_mutex, Executive, KernelMode, FALSE, NULL);
 
-		VioGpuObj *frontBuf = m_screen[pCurrentMod->DispInfo.TargetId].GetFrameBufferObj(FrameBufSlot::Front);
+		VioGpuObj *frontBuf = m_screen[pCurrentMod->DispInfo.TargetId].GetScanoutObj();
 		if (frontBuf == NULL) {
 			ERR("BlackOutScreen: front framebuffer is NULL for screen %d\n", pCurrentMod->DispInfo.TargetId);
 			KeReleaseMutex(&m_screen_mutex, FALSE);
@@ -1298,11 +1326,10 @@ UINT ColorFormat(UINT format)
 	return VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
 }
 
-void VioGpuAdapterLite::DestroyFrameBufferSlotObj(UINT32 screen_num, FrameBufSlot bufSlot, BOOLEAN bReset)
+void VioGpuAdapterLite::DestroyFrameBufferSlotObj(UINT32 screen_num, UINT slot, BOOLEAN bReset)
 {
 	TRACING();
-	UINT index = m_screen[screen_num].GetFrameBufferIndex(bufSlot);
-	DestroyFrameBufferObj(&m_screen[screen_num].m_pFrameBuf[index], bReset);
+	DestroyFrameBufferObj(&m_screen[screen_num].m_pFrameBuf[slot], bReset);
 }
 
 void VioGpuAdapterLite::DestroyFrameBufferObj(VioGpuObj **ppFbuf, BOOLEAN bReset)
@@ -1352,18 +1379,33 @@ void VioGpuAdapterLite::DestroyFrameBufferCursorObjExt()
 }
 
 PAGED_CODE_SEG_BEGIN
-void VioGpuAdapterLite::FlushFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURRENT_MODE *pCurrentMode)
+void VioGpuAdapterLite::FlushFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, UINT slot, CURRENT_MODE *pCurrentMode)
 {
 	PAGED_CODE();
 	TRACING();
 
 	UINT targetId = pCurrentMode->DispInfo.TargetId;
-	VioGpuObj *obj = m_screen[targetId].GetFrameBufferObj(FrameBufSlot::Front);
+	ScreenInfo &scr = m_screen[targetId];
+	VioGpuObj *obj = scr.m_pFrameBuf[slot];
 	if (obj == NULL) {
-		ERR("FlushFrameBufferObj: no persistent framebuffer for screen %d\n", targetId);
+		ERR("FlushFrameBufferObj: no persistent framebuffer in slot %u for screen %d\n", slot, targetId);
 		return;
 	}
 	UINT resid = (UINT)obj->GetId();
+
+	// Another of the UMD's frame buffers: switch the scanout to its resource.
+	// The resource and its host dmabuf exist already, so this costs no import;
+	// not waited for (the flush after it is).
+	if (scr.m_ScanoutSlot != (INT)slot) {
+		if (m_bBlobSupported) {
+			m_CtrlQueue.SetScanoutBlob(targetId, resid, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight,
+									   ColorFormat(pCurrentMode->DispInfo.ColorFormat), 0, 0, pCurrentMode->Stride,
+									   NULL);
+		} else {
+			m_CtrlQueue.SetScanout(targetId, resid, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
+		}
+		scr.m_ScanoutSlot = (INT)slot;
+	}
 
 	// Blob (udmabuf) resources are read directly from the guest pages, so a
 	// flush alone re-scans the updated content. Non-blob resources still need
@@ -1380,8 +1422,7 @@ void VioGpuAdapterLite::FlushFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, C
 	pCurrentMode->Flags.FrameBufferIsActive = TRUE;
 }
 
-void VioGpuAdapterLite::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, FrameBufSlot bufSlot,
-											 CURRENT_MODE *pCurrentMode)
+void VioGpuAdapterLite::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, UINT slot, CURRENT_MODE *pCurrentMode)
 {
 	UINT resid, format, size;
 	VioGpuObj *obj;
@@ -1389,7 +1430,8 @@ void VioGpuAdapterLite::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, 
 	TRACING();
 	DBGPRINT("%d: %d, (%d x %d)\n", m_Id, pCurrentMode->DispInfo.TargetId, pModeInfo->VisScreenWidth,
 			 pModeInfo->VisScreenHeight);
-	ASSERT(m_screen[pCurrentMode->DispInfo.TargetId].GetFrameBufferObj(bufSlot) == NULL);
+	ASSERT(m_screen[pCurrentMode->DispInfo.TargetId].m_pFrameBuf[slot] == NULL);
+	VioGpuMemSegment &segment = m_screen[pCurrentMode->DispInfo.TargetId].Segment(slot);
 	size = pCurrentMode->DispInfo.Pitch * pModeInfo->VisScreenHeight;
 	format = ColorFormat(pCurrentMode->DispInfo.ColorFormat);
 	DBGPRINT("(%d -> %d)\n", pCurrentMode->DispInfo.ColorFormat, format);
@@ -1401,19 +1443,17 @@ void VioGpuAdapterLite::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, 
 
 	// Update the frame segment based on the current mode
 	if (pCurrentMode->FrameBuffer.Ptr) {
-		if (m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment.GetFbVAddr()) {
-			m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment.Close();
+		if (segment.GetFbVAddr()) {
+			segment.Close();
 		}
-		if (!m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment.InitExt(size, pCurrentMode->FrameBuffer.Ptr,
-																			  pCurrentMode->DeviceMemory)) {
+		if (!segment.InitExt(size, pCurrentMode->FrameBuffer.Ptr, pCurrentMode->DeviceMemory)) {
 			ERR("Failed to initialize external framebuffer segment\n");
 			m_Idr.PutId(resid);
 			return;
 		}
-	} else if (m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment.GetFbVAddr() &&
-			   size > m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment.GetSize()) {
-		m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment.Close();
-		m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment.Init(size, NULL);
+	} else if (segment.GetFbVAddr() && size > segment.GetSize()) {
+		segment.Close();
+		segment.Init(size, NULL);
 	}
 
 	obj = new (NonPagedPoolNx) VioGpuObj();
@@ -1422,7 +1462,7 @@ void VioGpuAdapterLite::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, 
 		m_Idr.PutId(resid);
 		return;
 	}
-	if (!obj->Init(size, &m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment)) {
+	if (!obj->Init(size, &segment)) {
 		ERR("Failed to init obj size = %d\n", size);
 		delete obj;
 		m_Idr.PutId(resid);
@@ -1453,7 +1493,7 @@ void VioGpuAdapterLite::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, 
 			ERR("Host rejected the scanout blob for screen %d\n", pCurrentMode->DispInfo.TargetId);
 			m_CtrlQueue.SetScanout(pCurrentMode->DispInfo.TargetId, 0, 0, 0, 0, 0);
 			DestroyFrameBufferObj(&obj, FALSE);
-			m_screen[pCurrentMode->DispInfo.TargetId].m_FrameSegment.Close();
+			segment.Close();
 			return;
 		}
 	} else {
@@ -1467,7 +1507,7 @@ void VioGpuAdapterLite::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, 
 			 m_screen[pCurrentMode->DispInfo.TargetId].m_FlushCount);
 	m_CtrlQueue.ResFlush(resid, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0,
 						 pCurrentMode->DispInfo.TargetId, &m_screen[pCurrentMode->DispInfo.TargetId].m_FlushEvent);
-	m_screen[pCurrentMode->DispInfo.TargetId].SetFrameBufferObj(obj, bufSlot);
+	m_screen[pCurrentMode->DispInfo.TargetId].m_pFrameBuf[slot] = obj;
 	pCurrentMode->FrameBuffer.Ptr = obj->GetVirtualAddress();
 	pCurrentMode->Flags.FrameBufferIsActive = TRUE;
 }

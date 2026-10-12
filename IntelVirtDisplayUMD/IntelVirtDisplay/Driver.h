@@ -166,6 +166,32 @@ private:
 	void disable_device_mem(BOOL permanently);
 	void release_kmd_framebuffer();
 
+	// Device memory path, pipelined: this thread copies each frame into one
+	// of the copier's frame buffers and releases the IddCx frame at once; a
+	// present thread hands the latest copied buffer to the KMD (SET_MODE
+	// after a mode change, FRAME_DATA), which waits for the host. The buffer
+	// on screen is never written: the host may still be reading it (it may
+	// answer a flush before it has copied the frame). Indices into the
+	// copier's buffers, NO_BUFFER for none; guarded by m_present_lock.
+	static constexpr int NO_BUFFER = -1;
+	SRWLOCK m_present_lock;
+	CONDITION_VARIABLE m_present_cv;
+	int m_ready;      // copied, not yet taken by the present thread
+	int m_presenting; // being handed to the KMD and host
+	int m_scanout;    // on screen
+	BOOL m_mode_pending; // send SET_MODE with the next present
+	BOOL m_present_stop;
+	BOOL m_present_failed; // an IOCTL failed; the frame thread falls back
+	HANDLE m_present_thread;
+	// Frame metadata of the current mode; the present thread fills in addr.
+	struct FrameMetaData m_present_meta;
+
+	void start_presenting();
+	void stop_presenting();
+	int take_write_buffer();
+	void present_loop();
+	static DWORD CALLBACK PresentThread(LPVOID Argument);
+
 	void GetCursorData();
 	void ProcessCursorDataLegacy(UINT *tempshapeid, INT *tempX, INT *tempY);
 	void ProcessCursorData(UINT *tempshapeid, UINT *tempposid, INT *tempX, INT *tempY);
