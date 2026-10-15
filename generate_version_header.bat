@@ -29,20 +29,17 @@ if not exist "%outputDir%" (
 
 set "version="
 
-REM Parse version from the first non-comment, non-empty key=value line
-for /f "usebackq tokens=1,* delims== " %%a in ("%versionFile%") do (
-    set "key=%%a"
+REM Parse version from the "<Name>_Version = x.y.z" line. findstr picks the
+REM line so comment lines never reach the loop: Wine's cmd, used by the Linux
+REM CI build, doesn't skip ';' lines in for /f and can't parse chained ifs.
+for /f "tokens=1,* delims== " %%a in ('findstr /c:"_Version =" "%versionFile%"') do (
     set "val=%%b"
 
     REM Trim spaces
-    for /f "tokens=* delims= " %%x in ("!key!") do set "key=%%x"
     for /f "tokens=* delims= " %%x in ("!val!") do set "val=%%x"
 
-    REM Skip empty lines or comment lines
-    if not "!key!"=="" if not "!key:~0,2!"=="//" if not "!key:~0,2!"=="/*" if not "!key:~0,1!"=="#" (
-        set "version=!val!"
-        goto :gotVersion
-    )
+    set "version=!val!"
+    goto :gotVersion
 )
 
 :gotVersion
@@ -67,13 +64,12 @@ if defined buildNumber (
 )
 
 echo Generating version header at "%headerFile%"
-(
-    echo #pragma once
-    echo #define FILE_VERSION %fullVersion:.=, %
-    echo #define PRODUCT_VERSION %fullVersion:.=, %
-    echo #define FILE_VERSION_STR "%fullVersion%\0"
-    echo #define PRODUCT_VERSION_STR "%fullVersion%\0"
-) > "%headerFile%"
+REM One redirect per line: Wine's cmd doesn't redirect parenthesized blocks
+> "%headerFile%" echo #pragma once
+>> "%headerFile%" echo #define FILE_VERSION %fullVersion:.=, %
+>> "%headerFile%" echo #define PRODUCT_VERSION %fullVersion:.=, %
+>> "%headerFile%" echo #define FILE_VERSION_STR "%fullVersion%\0"
+>> "%headerFile%" echo #define PRODUCT_VERSION_STR "%fullVersion%\0"
 
 echo Done.
 endlocal

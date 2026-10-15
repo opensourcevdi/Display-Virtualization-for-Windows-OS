@@ -1,0 +1,58 @@
+# Builds the IntelVirtDisplay driver package on a Linux runner with MSVC,
+# the WDK and MSBuild running under Wine, and exports it as a job artifact
+# laid out the way IntelVirtDisplayInstaller.ps1 expects.
+#
+# The toolchain image (ci/Dockerfile) is built by the `toolchain` job and kept
+# in this project's container registry. The Microsoft tools inside it are not
+# redistributable, so keep the registry private.
+#
+# If the runners don't allow Docker-in-Docker, build and push the image once
+# from any Linux machine with Docker (registry address: Deploy > Container
+# registry in the project):
+#   docker login <registry>
+#   docker build -t <registry>/<project path>/msvc-wine:wdk-10.0.28000 ci/
+#   docker push <registry>/<project path>/msvc-wine:wdk-10.0.28000
+
+stages:
+  - toolchain
+  - build
+
+variables:
+  TOOLCHAIN_IMAGE: $CI_REGISTRY_IMAGE/msvc-wine:wdk-10.0.28000
+
+# Rebuilds the toolchain image when ci/Dockerfile changes, or on demand from
+# the pipeline UI. Needs a runner that allows Docker-in-Docker (privileged).
+toolchain:
+  stage: toolchain
+  image: docker:28
+  services:
+    - docker:28-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker build -t "$TOOLCHAIN_IMAGE" ci/
+    - docker push "$TOOLCHAIN_IMAGE"
+  rules:
+    - changes:
+        - ci/Dockerfile
+    - when: manual
+      allow_failure: true
+
+build-driver:
+  stage: build
+  image: $TOOLCHAIN_IMAGE
+  parallel:
+    matrix:
+      - CONFIG: [Release, Debug]
+  variables:
+    # Names the output (ZCBuild_<n>_Installer) and is appended to the versions
+    BUILD_NUMBER: $CI_PIPELINE_IID
+  script:
+    - ci/build.sh "$CONFIG"
+  artifacts:
+    name: "ZCBuild_${CI_PIPELINE_IID}_Installer_$CONFIG"
+    paths:
+      - ZCBuild_*_Installer/
+      - ZCBuild_*_Symbols/
+    expire_in: 30 days
